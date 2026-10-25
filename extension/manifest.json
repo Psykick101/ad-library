@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Save to Psykick Studio",
+  "version": "1.0.0",
+  "description": "Save ads you find anywhere (BigSpy, PiPiAds, Meta Ad Library, TikTok, any site) to the Psykick Creative Studio library.",
+  "permissions": ["contextMenus", "activeTab", "scripting", "storage", "notifications"],
+  "host_permissions": ["https://studio.psykick.cc/*"],
+  "background": {"service_worker": "background.js"},
+  "action": {"default_title": "Save to Psykick Studio", "default_popup": "popup.html", "default_icon": {"128": "icon128.png"}},
+  "icons": {"128": "icon128.png"},
+  "commands": {"save-area": {"suggested_key": {"default": "Alt+Shift+S"}, "description": "Select an area and save it"}}
+}

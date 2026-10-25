@@ -1,0 +1,20 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+body{width:300px;margin:0;font:14px system-ui,sans-serif;background:#0f1216;color:#e6eaef}
+.h{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid #262e38;font-weight:600}
+.h i{width:10px;height:10px;border-radius:50%;background:#7cc4a8}
+.b{padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+button{font:600 14px system-ui;border:0;border-radius:10px;padding:10px;cursor:pointer;background:#7cc4a8;color:#0f1216}
+button.s{background:#1b2129;color:#e6eaef;border:1px solid #262e38}
+input{font:14px system-ui;background:#161b21;border:1px solid #262e38;color:#e6eaef;border-radius:8px;padding:8px}
+a{color:#7cc4a8}.m{color:#8b96a3;font-size:12px}
+</style></head><body>
+<div class="h"><i></i>Save to Psykick Studio</div>
+<div class="b">
+  <button id="area">Select an area and save</button>
+  <button class="s" id="shot">Save what's on screen</button>
+  <input id="tags" placeholder="Tags (comma separated, optional)">
+  <input id="note" placeholder="Why it's interesting (optional)">
+  <p class="m">Tip: right-click any image or video → "Save to Psykick Studio". Shortcut: Alt+Shift+S.</p>
+  <a href="https://studio.psykick.cc/studio#inspiration" target="_blank">Open the library</a>
+</div>
+<script src="popup.js"></script></body></html>
