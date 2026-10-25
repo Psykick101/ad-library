@@ -14,6 +14,7 @@ Part of the Psykick / home-lab microservices split (2026-10-25). Each service ha
 - `extension/popup.html`
 - `extension/popup.js`
 - `library_service.py`
+- `test_library.py`
 
 ## Deploy
 

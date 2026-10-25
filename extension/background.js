@@ -2,9 +2,31 @@
 const STUDIO = "https://studio.psykick.cc";
 const SOCIAL = ["*://*.tiktok.com/*", "*://*.instagram.com/*", "*://*.facebook.com/*", "*://*.youtube.com/*",
                 "*://*.x.com/*", "*://*.twitter.com/*", "*://*.pinterest.com/*", "*://*.linkedin.com/*", "*://*.snapchat.com/*"];
-const FETCH_HOSTS = ["tiktok.com", "instagram.com", "facebook.com", "fb.watch", "youtube.com", "youtu.be", "x.com",
-                     "twitter.com", "pinterest.com", "linkedin.com", "snapchat.com"];
+let FETCH_HOSTS = ["tiktok.com", "instagram.com", "facebook.com", "fb.watch", "youtube.com", "youtu.be", "x.com",
+                   "twitter.com", "pinterest.com", "linkedin.com", "snapchat.com"];
 const fetchable = u => { try { const h = new URL(u).hostname; return FETCH_HOSTS.some(x => h === x || h.endsWith("." + x)); } catch (e) { return false; } };
+
+// ---- version + updates: the Studio publishes /ui/psykick-saver.json {version, notes, config}. A newer version shows a
+// "NEW" badge and an Update button in the popup. config = data only (supported sites / link patterns), so most fixes
+// for sites changing their pages reach everyone without reinstalling.
+const VERSION = chrome.runtime.getManifest().version;
+const newer = (a, b) => { const x = a.split(".").map(Number), y = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); } return false; };
+async function checkUpdate() {
+  try {
+    const r = await fetch(STUDIO + "/ui/psykick-saver.json", {credentials: "include", cache: "no-store"});
+    const j = await r.json();
+    await chrome.storage.local.set({latest: j, checked: Date.now()});
+    if (j.config && Array.isArray(j.config.fetch_hosts)) FETCH_HOSTS = j.config.fetch_hosts;
+    chrome.action.setBadgeText({text: newer(j.version || "0", VERSION) ? "NEW" : ""});
+    chrome.action.setBadgeBackgroundColor({color: "#7cc4a8"});
+    return j;
+  } catch (e) { return null; }
+}
+chrome.runtime.onStartup.addListener(checkUpdate);
+chrome.alarms.create("upd", {periodInMinutes: 360});
+chrome.alarms.onAlarm.addListener(a => { if (a.name === "upd") checkUpdate(); });
+chrome.storage.local.get("latest").then(({latest}) => { if (latest && latest.config && Array.isArray(latest.config.fetch_hosts)) FETCH_HOSTS = latest.config.fetch_hosts; });
 
 // Runs in the page: the right-clicked element -> that post's own link + its caption / author text.
 function findPost(linkUrl) {
@@ -45,6 +67,7 @@ async function savePost(tab, linkUrl) {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
+  checkUpdate();
   chrome.contextMenus.create({id: "img", title: "Save image to Psykick Studio", contexts: ["image"]});
   chrome.contextMenus.create({id: "vid", title: "Save video to Psykick Studio (with source)", contexts: ["video"]});
   chrome.contextMenus.create({id: "post", title: "Save this post's video (with source)", contexts: ["page", "link"],
@@ -154,6 +177,8 @@ chrome.runtime.onMessage.addListener((m, _s, reply) => {
     const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
     if (m.do === "area") await selectArea(tab);
     if (m.do === "post") await savePost(tab, "");
+    if (m.do === "check") { reply({latest: await checkUpdate(), version: VERSION}); return; }
+    if (m.do === "reload") { chrome.runtime.reload(); return; }
     if (m.do === "shot") await post({data_url: await shot(tab), page_url: tab.url, title: tab.title, source: "extension-screen", note: m.note, tags: m.tags});
     reply({ok: true});
   })();
