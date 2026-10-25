@@ -1,9 +1,54 @@
 // Save to Psykick Studio - context menus + area capture. Uses your Studio sign-in (no keys).
 const STUDIO = "https://studio.psykick.cc";
+const SOCIAL = ["*://*.tiktok.com/*", "*://*.instagram.com/*", "*://*.facebook.com/*", "*://*.youtube.com/*",
+                "*://*.x.com/*", "*://*.twitter.com/*", "*://*.pinterest.com/*", "*://*.linkedin.com/*", "*://*.snapchat.com/*"];
+const FETCH_HOSTS = ["tiktok.com", "instagram.com", "facebook.com", "fb.watch", "youtube.com", "youtu.be", "x.com",
+                     "twitter.com", "pinterest.com", "linkedin.com", "snapchat.com"];
+const fetchable = u => { try { const h = new URL(u).hostname; return FETCH_HOSTS.some(x => h === x || h.endsWith("." + x)); } catch (e) { return false; } };
+
+// Runs in the page: the right-clicked element -> that post's own link + its caption / author text.
+function findPost(linkUrl) {
+  const pats = [/\/video\/\d+/, /\/reels?\/[\w-]+/, /\/p\/[\w-]+/, /\/watch\?v=/, /\/shorts\/[\w-]+/, /\/status\/\d+/,
+                /ads\/library\/\?.*id=\d+/, /\/videos\/\d+/, /\/pin\/\d+/, /\/posts\//];
+  const good = h => pats.some(p => p.test(h));
+  if (linkUrl && good(linkUrl)) return {url: linkUrl, text: ""};
+  const el = window.__psykickLast || document.activeElement;
+  let n = el, box = null;
+  for (let i = 0; i < 18 && n; i++, n = n.parentElement) {
+    const as = n.tagName === "A" ? [n] : [];
+    if (n.querySelectorAll) as.push(...n.querySelectorAll("a[href]"));
+    const hit = as.find(a => good(a.href));
+    if (hit) { box = n; return {url: hit.href, text: (box.innerText || "").slice(0, 600)}; }
+  }
+  if (location.hostname.includes("tiktok.com")) {       // For You feed: build the link from the author + the video id
+    n = el;
+    for (let i = 0; i < 18 && n; i++, n = n.parentElement) {
+      const id = ((n.id || "") + " " + (n.getAttribute && (n.getAttribute("data-video-id") || "") || "")).match(/(\d{17,21})/);
+      const au = n.querySelector && n.querySelector('a[href*="/@"]');
+      if (id && au) { const user = new URL(au.href).pathname.split("/")[1];
+        return {url: `https://www.tiktok.com/${user}/video/${id[1]}`, text: (n.innerText || "").slice(0, 600)}; }
+    }
+  }
+  return {url: good(location.href) ? location.href : "", text: ""};
+}
+
+async function savePost(tab, linkUrl) {
+  let r = {url: "", text: ""};
+  try { [{result: r}] = await chrome.scripting.executeScript({target: {tabId: tab.id}, func: findPost, args: [linkUrl || ""]}); }
+  catch (e) { /* page didn't allow scripts */ }
+  const url = r && r.url;
+  if (!url || !fetchable(url)) { notify("Couldn't find this post's link", "Open the post itself (its own page) and try again, or use 'Select an area'."); return false; }
+  let fallback = "";
+  try { fallback = await shot(tab); } catch (e) {}
+  await post({page_url: url, fetch: "1", data_url: fallback, ad_text: r.text || "", title: tab.title, source: "extension-video"});
+  return true;
+}
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({id: "img", title: "Save image to Psykick Studio", contexts: ["image"]});
-  chrome.contextMenus.create({id: "vid", title: "Save video to Psykick Studio", contexts: ["video"]});
+  chrome.contextMenus.create({id: "vid", title: "Save video to Psykick Studio (with source)", contexts: ["video"]});
+  chrome.contextMenus.create({id: "post", title: "Save this post's video (with source)", contexts: ["page", "link"],
+    documentUrlPatterns: SOCIAL});
   chrome.contextMenus.create({id: "area", title: "Select an area and save it", contexts: ["page", "image", "video", "link"]});
   chrome.contextMenus.create({id: "shot", title: "Save what's on screen", contexts: ["page", "image", "video", "link"]});
 });
@@ -28,7 +73,8 @@ async function post(fields) {
   const j = await r.json();
   if (!r.ok) { notify("Not saved", j.error || "Something went wrong."); return; }
   notify(j.duplicate ? "Already in the library" : "Saved to Psykick Studio ✓",
-         j.duplicate ? "Someone saved this one before." : "The AI is reading it now. Find it under Inspiration.");
+         j.duplicate ? "Someone saved this one before." : j.fetching ? "Downloading the video with its source (author, caption, stats) - it shows under Inspiration in a minute."
+         : "The AI is reading it now. Find it under Inspiration.");
   const {recent = []} = await chrome.storage.local.get("recent");
   recent.unshift({id: j.id, ts: Date.now(), page: fields.page_url || ""});
   chrome.storage.local.set({recent: recent.slice(0, 20)});
@@ -76,8 +122,15 @@ async function selectArea(tab) {
 }
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId === "img" || info.menuItemId === "vid") {
+  if (info.menuItemId === "post") {
+    await savePost(tab, info.linkUrl);
+  } else if (info.menuItemId === "img" || info.menuItemId === "vid") {
     const src = info.srcUrl || "";
+    const social = fetchable(info.pageUrl || tab.url || "");
+    if (info.menuItemId === "vid" && (social || src.startsWith("blob:") || !src)) {   // real video + source via the post link
+      if (await savePost(tab, "")) return;
+      if (!src || src.startsWith("blob:")) return;
+    }
     if (src.startsWith("blob:") || src.startsWith("data:") || !src) {
       notify("This video can't be downloaded directly", "Use 'Select an area and save it' instead.");
       return;
@@ -100,6 +153,7 @@ chrome.runtime.onMessage.addListener((m, _s, reply) => {
   (async () => {
     const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
     if (m.do === "area") await selectArea(tab);
+    if (m.do === "post") await savePost(tab, "");
     if (m.do === "shot") await post({data_url: await shot(tab), page_url: tab.url, title: tab.title, source: "extension-screen", note: m.note, tags: m.tags});
     reply({ok: true});
   })();

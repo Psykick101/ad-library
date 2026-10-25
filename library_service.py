@@ -4,6 +4,11 @@ Saves ads the team finds anywhere (BigSpy, PiPiAds, Meta Ad Library, TikTok, any
 Chrome extension or the Studio, plus search in Foreplay's database while we still have Foreplay. Each saved ad gets an
 AI read (what it sells, hook, style, layout, text) so the Studio's creative AI can learn from it.
 
+Videos with their source (2026-10-25): for TikTok / Instagram / Facebook / YouTube / X posts the extension (or "Paste a
+link" in the Studio) sends the post's link with fetch=1; the service downloads the real video with yt-dlp and keeps the
+source: author, caption, views/likes/comments/shares, post date, sound, link (in `extra`). Blob videos that a browser
+can't download (TikTok, Reels) work this way too.
+
 Runs on 127.0.0.1:8775, own SQLite (/var/lib/ad-library/library.db), media in Nextcloud Creative/Inspiration/.
 Only the Studio talks to it (shared key /etc/ai-secrets/ad-library.key in header X-Library-Key, user in X-User).
 Foreplay key (optional): /etc/ai-secrets/foreplay.env FOREPLAY_API_KEY=...; monthly credit cap FOREPLAY_MONTHLY_CAP
@@ -99,6 +104,80 @@ def store(data: bytes, ctype: str, platform: str) -> tuple[str, str, str]:
     if not p.exists():
         p.write_bytes(data)
     return str(p), ("video" if ext in (".mp4", ".webm", ".mov") else "image"), sha
+
+
+# ---------- video + source from a post link (yt-dlp) ----------
+FETCH_HOSTS = ("tiktok.com", "instagram.com", "facebook.com", "fb.watch", "youtube.com", "youtu.be", "x.com",
+               "twitter.com", "snapchat.com", "pinterest.com", "linkedin.com", "vm.tiktok.com")
+
+
+def fetchable(url: str) -> bool:
+    try:
+        host = httpx.URL(url).host or ""
+    except Exception:  # noqa: BLE001
+        return False
+    return url.startswith("http") and any(host == h or host.endswith("." + h) for h in FETCH_HOSTS)
+
+
+def fetch_source(url: str) -> tuple[bytes, str, dict]:
+    """-> (video bytes, content type, source facts). Raises with a short reason."""
+    import tempfile
+    import yt_dlp
+    with tempfile.TemporaryDirectory() as td:
+        opts = {"outtmpl": f"{td}/v.%(ext)s", "quiet": True, "no_warnings": True, "noplaylist": True,
+                "format": "best[ext=mp4][height<=1080]/bv*[ext=mp4][height<=1080]+ba[ext=m4a]/best[height<=1080]/best",
+                "merge_output_format": "mp4", "max_filesize": MAX_BYTES, "socket_timeout": 30, "retries": 2,
+                "ffmpeg_location": "/usr/local/bin/ffmpeg"}
+        try:
+            from yt_dlp.networking.impersonate import ImpersonateTarget   # TikTok needs a browser-like client
+            opts["impersonate"] = ImpersonateTarget("chrome")
+        except Exception:  # noqa: BLE001
+            pass
+        with yt_dlp.YoutubeDL(opts) as y:
+            try:
+                info = y.extract_info(url, download=True)
+            except Exception:  # noqa: BLE001
+                opts.pop("impersonate", None)
+                with yt_dlp.YoutubeDL(opts) as y2:
+                    info = y2.extract_info(url, download=True)
+        if info.get("entries"):
+            info = (info["entries"] or [{}])[0]
+        files = sorted(pathlib.Path(td).glob("v.*"), key=lambda f: f.stat().st_size, reverse=True)
+        if not files:
+            raise ValueError("no video in that post")
+        f = files[0]
+        ctype = {".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime", ".jpg": "image/jpeg",
+                 ".png": "image/png", ".webp": "image/webp"}.get(f.suffix.lower(), "video/mp4")
+        facts = {k: info.get(k) for k in ("webpage_url", "uploader", "uploader_id", "uploader_url", "channel", "title",
+                                          "description", "view_count", "like_count", "comment_count", "repost_count",
+                                          "upload_date", "timestamp", "duration", "track", "artist", "thumbnail")
+                 if info.get(k) not in (None, "")}
+        return f.read_bytes(), ctype, facts
+
+
+def _fetch_job(aid: str, url: str) -> None:
+    try:
+        data, ctype, facts = fetch_source(url)
+        a = q("select * from ads where id=?", (aid,), one=True) or {}
+        path, kind, sha = store(data, ctype, a.get("platform") or platform_of(url))
+        dup = q("select id from ads where sha=? and id<>?", (sha, aid), one=True)
+        if dup:
+            q("delete from ads where id=?", (aid,))
+            return
+        extra = {**json.loads(a.get("extra") or "{}"), "fetch": "done", "source": facts}
+        desc = str(facts.get("description") or facts.get("title") or "")
+        q("update ads set media=?, kind=?, sha=?, brand=coalesce(nullif(brand,''), ?), ad_text=coalesce(nullif(ad_text,''), ?), "
+          "title=coalesce(nullif(title,''), ?), page_url=?, extra=? where id=?",
+          (path, kind, sha, str(facts.get("uploader") or facts.get("channel") or "")[:120], desc[:2000],
+           str(facts.get("title") or "")[:200], str(facts.get("webpage_url") or url)[:500], json.dumps(extra), aid))
+        threading.Thread(target=_scan, args=(pathlib.Path(path).parent,), daemon=True).start()
+        ai_read(aid)
+    except Exception as e:  # noqa: BLE001
+        a = q("select extra, media from ads where id=?", (aid,), one=True) or {}
+        extra = {**json.loads(a.get("extra") or "{}"), "fetch": "failed", "fetch_error": str(e)[:200]}
+        q("update ads set extra=? where id=?", (json.dumps(extra), aid))
+        if a.get("media"):
+            ai_read(aid)       # the screenshot that came with it still gets read
 
 
 # ---------- AI read ----------
@@ -223,6 +302,30 @@ async def save(request: Request):
     page = str(form.get("page_url") or "")[:500]
     plat = str(form.get("platform") or "") or platform_of(page or str(form.get("media_url") or ""))
     data, ctype = None, ""
+    want = str(form.get("fetch") or "") == "1" and fetchable(page)
+    if str(form.get("fetch") or "") == "1" and not want and not (form.get("data_url") or form.get("file") or form.get("media_url")):
+        return JSONResponse({"error": "paste a TikTok, Instagram, Facebook, YouTube or X post link"}, status_code=400)
+    if want:   # the real video + its source, downloaded in the background (a screenshot may come along as a fallback)
+        same = q("select id from ads where page_url=? and media<>''", (page,), one=True)
+        if same:
+            return JSONResponse({"id": same["id"], "duplicate": True})
+        aid = _id()
+        shot_path, shot_kind, shot_sha = "", "", ""
+        if form.get("data_url"):
+            m = re.match(r"data:([\w/+.-]+);base64,(.*)", str(form.get("data_url")), re.S)
+            if m:
+                try:
+                    shot_path, shot_kind, shot_sha = store(base64.b64decode(m.group(2)), m.group(1), plat)
+                except ValueError:
+                    pass
+        q("insert into ads values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            aid, time.time(), by, str(form.get("source") or "extension")[:20], plat[:30], page, shot_path, shot_kind,
+            shot_sha or f"pending-{aid}", str(form.get("title") or "")[:200], str(form.get("brand") or "")[:120],
+            str(form.get("ad_text") or "")[:2000],
+            json.dumps([t.strip()[:30] for t in str(form.get("tags") or "").split(",") if t.strip()][:12]),
+            str(form.get("note") or "")[:600], "", "", json.dumps({"fetch": "working"})))
+        threading.Thread(target=_fetch_job, args=(aid, page), daemon=True).start()
+        return JSONResponse({"id": aid, "fetching": True, "platform": plat})
     f = form.get("file")
     if f is not None and getattr(f, "filename", None):
         data, ctype = await f.read(), f.content_type or "application/octet-stream"
@@ -287,6 +390,7 @@ async def items(request: Request):
     for r in rows:
         r["ai"] = json.loads(r["ai"] or "{}")
         r["tags"] = json.loads(r["tags"] or "[]")
+        r["extra"] = json.loads(r["extra"] or "{}")
     plats = [r["platform"] for r in q("select distinct platform from ads order by platform")]
     return JSONResponse({"items": rows, "platforms": plats, "total": q("select count(*) c from ads", one=True)["c"],
                          "foreplay": {"connected": bool(fp_key()), "used": fp_used(), "cap": fp_cap()}})

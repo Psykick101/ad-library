@@ -9,6 +9,7 @@ Part of the Psykick / home-lab microservices split (2026-10-25). Each service ha
 - `README.md`
 - `extension/background.js`
 - `extension/icon128.png`
+- `extension/lastclick.js`
 - `extension/manifest.json`
 - `extension/popup.html`
 - `extension/popup.js`
