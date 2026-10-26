@@ -1,8 +1,8 @@
 {
  "manifest_version": 3,
  "name": "Save to Psykick Studio",
- "version": "1.2.0",
- "description": "Save ads you find anywhere (TikTok, Instagram, Facebook, Meta Ad Library, YouTube, BigSpy, PiPiAds, any site) to the Psykick Creative Studio library - videos come with their source (author, caption, stats, link).",
+ "version": "1.3.0",
+ "description": "Save ads you find anywhere to the Psykick Creative Studio library. Videos are found by their post link and downloaded for real, with their source (author, caption, stats).",
  "permissions": [
   "activeTab",
   "alarms",
@@ -33,8 +33,13 @@
    "suggested_key": {
     "default": "Alt+Shift+S"
    },
-   "description": "Select an area and save it"
+   "description": "Select an area (or click a video) and save it"
   }
+ },
+ "externally_connectable": {
+  "matches": [
+   "https://studio.psykick.cc/*"
+  ]
  },
  "content_scripts": [
   {
@@ -46,6 +51,15 @@
    ],
    "run_at": "document_start",
    "all_frames": false
+  },
+  {
+   "matches": [
+    "https://studio.psykick.cc/studio/extension/connect*"
+   ],
+   "js": [
+    "connect.js"
+   ],
+   "run_at": "document_start"
   }
  ]
 }

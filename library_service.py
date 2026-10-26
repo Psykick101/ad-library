@@ -4,10 +4,12 @@ Saves ads the team finds anywhere (BigSpy, PiPiAds, Meta Ad Library, TikTok, any
 Chrome extension or the Studio, plus search in Foreplay's database while we still have Foreplay. Each saved ad gets an
 AI read (what it sells, hook, style, layout, text) so the Studio's creative AI can learn from it.
 
-Videos with their source (2026-10-25): for TikTok / Instagram / Facebook / YouTube / X posts the extension (or "Paste a
-link" in the Studio) sends the post's link with fetch=1; the service downloads the real video with yt-dlp and keeps the
-source: author, caption, views/likes/comments/shares, post date, sound, link (in `extra`). Blob videos that a browser
-can't download (TikTok, Reels) work this way too.
+Videos with their source: the extension (or "Paste a link", or the phone bots) sends the post's link with fetch=1.
+2026-10-27 pipeline: canonical(link) -> one row with status "queued" (+ the screenshot as its thumbnail) and a job in the
+`jobs` table -> background workers download it (yt-dlp, TikTok via curl_cffi impersonation, h264 mp4 <=1080p, or the
+video file's own address for sites yt-dlp can't read) -> "downloading" -> "reading" (AI) -> "done", or "failed" with a
+reason a person understands; network-type failures retry 3x with backoff. The same post saved twice (any link shape)
+is one row. GET /v1/status?ids=... is what the extension and the Inspiration "Saving..." cards poll.
 
 Runs on 127.0.0.1:8775, own SQLite (/var/lib/ad-library/library.db), media in Nextcloud Creative/Inspiration/.
 Only the Studio talks to it (shared key /etc/ai-secrets/ad-library.key in header X-Library-Key, user in X-User).
@@ -66,15 +68,49 @@ def q(sql, args=(), one=False):
             create table if not exists usage(month text primary key, foreplay_credits int default 0);
             create table if not exists folders(id text primary key, name text, parent text default '', by text, ts real);
             create table if not exists ad_folders(ad_id text, folder_id text, ts real, primary key(ad_id, folder_id));
+            create table if not exists jobs(id text primary key, ad_id text, mode text, url text, media_url text, referer text,
+              status text, tries int default 0, error text default '', created real, updated real, next_at real default 0);
+            create index if not exists jobs_due on jobs(status, next_at);
             """)
+            _migrate(_con)
         cur = _con.execute(sql, args)
         _con.commit()
         rows = [dict(r) for r in cur.fetchall()]
     return (rows[0] if rows else None) if one else rows
 
 
+def _migrate(con) -> None:
+    """2026-10-27: canon (dedupe key of the post: "tiktok:<id>", "instagram:<code>"...) + status (queued / downloading /
+    reading / done / failed) on every save. Old rows get both filled in once."""
+    cols = [r[1] for r in con.execute("pragma table_info(ads)")]
+    if "canon" not in cols:
+        con.execute("alter table ads add column canon text default ''")
+        con.execute("alter table ads add column status text default ''")
+        for r in con.execute("select id, page_url, media, extra from ads").fetchall():
+            c = canonical(r[1] or "")
+            ex = json.loads(r[3] or "{}")
+            st = "failed" if ex.get("fetch") == "failed" else ("done" if r[2] else "queued" if ex.get("fetch") == "working" else "")
+            con.execute("update ads set canon=?, status=? where id=?", (c["key"] if c else "", st, r[0]))
+        con.execute("create index if not exists ads_canon on ads(canon)")
+    con.commit()
+
+
 def _id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+COLS = ("id", "ts", "by", "source", "platform", "page_url", "media", "kind", "sha", "title", "brand", "ad_text", "tags",
+        "note", "ai", "foreplay_id", "extra", "canon", "status")
+
+
+def insert_ad(**v) -> str:
+    v.setdefault("id", _id())
+    v.setdefault("ts", time.time())
+    row = {c: v.get(c, "") for c in COLS}
+    row["extra"] = row["extra"] or "{}"
+    row["tags"] = row["tags"] or "[]"
+    q(f"insert into ads({', '.join(COLS)}) values({', '.join('?' * len(COLS))})", tuple(row[c] for c in COLS))
+    return row["id"]
 
 
 def platform_of(url: str) -> str:
@@ -110,7 +146,9 @@ def store(data: bytes, ctype: str, platform: str) -> tuple[str, str, str]:
 
 # ---------- video + source from a post link (yt-dlp) ----------
 FETCH_HOSTS = ("tiktok.com", "instagram.com", "facebook.com", "fb.watch", "youtube.com", "youtu.be", "x.com",
-               "twitter.com", "snapchat.com", "pinterest.com", "linkedin.com", "vm.tiktok.com")
+               "twitter.com", "snapchat.com", "pinterest.com", "pin.it", "linkedin.com", "vm.tiktok.com")
+FFMPEG = os.getenv("FFMPEG", "/usr/local/bin/ffmpeg" if pathlib.Path("/usr/local/bin/ffmpeg").exists() else "ffmpeg")
+MAX_TRIES = 3
 
 
 def fetchable(url: str) -> bool:
@@ -118,30 +156,138 @@ def fetchable(url: str) -> bool:
         host = httpx.URL(url).host or ""
     except Exception:  # noqa: BLE001
         return False
-    return url.startswith("http") and any(host == h or host.endswith("." + h) for h in FETCH_HOSTS)
+    return url.startswith("http") and (any(host == h or host.endswith("." + h) for h in FETCH_HOSTS)
+                                       or bool(re.search(r"(^|\.)pinterest\.[a-z.]+$", host)))
+
+
+def canonical(url: str) -> dict | None:
+    """A post link in any of its shapes -> {"url": the clean post link, "key": dedupe key, "platform", "id",
+    "direct": True when yt-dlp can't read that site (TikTok Creative Center / TikTok ad library: the extension sends the
+    video file's own address along)}. None = not a post (a feed, a profile, a search...).
+    Mirrors canonical() in extension/finder.js - keep both in step (tests: test_library.py + tests/ext)."""
+    from urllib.parse import parse_qs, urlsplit
+    try:
+        u = urlsplit((url or "").strip())
+    except ValueError:
+        return None
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return None
+    h, path, qs = u.hostname.lower(), re.sub(r"/{2,}", "/", u.path or "/"), parse_qs(u.query)
+    one = lambda k: (qs.get(k) or [""])[0]  # noqa: E731
+
+    def out(plat, key, clean, pid="", direct=False):
+        return {"url": clean, "key": key, "platform": plat, "id": pid, "direct": direct}
+    if h == "tiktok.com" or h.endswith(".tiktok.com"):
+        if h.startswith("ads.tiktok.com") or "/creativecenter/" in path:
+            m = re.search(r"/topads/(\d{6,})", path) or re.search(r"/(\d{15,})", path)
+            if m:
+                return out("TikTok", f"tiktok-cc:{m[1]}", f"https://ads.tiktok.com/business/creativecenter/topads/{m[1]}/pc/en", m[1], True)
+            return None
+        if h.startswith("library.tiktok.com"):
+            aid = one("ad_id") or one("id")
+            return out("TikTok", f"tiktok-ad:{aid}", f"https://library.tiktok.com/ads/detail/?ad_id={aid}", aid, True) if aid.isdigit() else None
+        m = re.match(r"/(@[\w.-]+)/(video|photo)/(\d{8,})", path)
+        if m:
+            return out("TikTok", f"tiktok:{m[3]}", f"https://www.tiktok.com/{m[1]}/{m[2]}/{m[3]}", m[3])
+        m = re.match(r"/(?:embed(?:/v2)?|v)/(\d{8,})", path)
+        if m:
+            return out("TikTok", f"tiktok:{m[1]}", f"https://www.tiktok.com/embed/v2/{m[1]}", m[1])
+        if h.split(".")[0] in ("vm", "vt") or path.startswith("/t/"):
+            return out("TikTok", "url:" + h + path.rstrip("/"), f"https://{h}{path}", "")
+        return None
+    if h.endswith("instagram.com"):
+        m = re.match(r"/(?:[\w.]+/)?(p|reels?|tv)/([\w-]{5,})", path)
+        if m:
+            kind = "p" if m[1] == "p" else "reel" if m[1].startswith("reel") else "tv"
+            return out("Meta", f"instagram:{m[2]}", f"https://www.instagram.com/{kind}/{m[2]}/", m[2])
+        m = re.match(r"/stories/([\w.]+)/(\d+)", path)
+        if m:
+            return out("Meta", f"ig-story:{m[2]}", f"https://www.instagram.com/stories/{m[1]}/{m[2]}/", m[2])
+        return None
+    if h == "fb.watch" or h.endswith(".fb.watch"):
+        return out("Meta", "url:fb.watch" + path.rstrip("/"), f"https://fb.watch{path}", "") if len(path) > 2 else None
+    if h.endswith("facebook.com"):
+        if path.startswith("/ads/library"):
+            aid = one("id")
+            return out("Meta", f"fb-ad:{aid}", f"https://www.facebook.com/ads/library/?id={aid}", aid) if aid.isdigit() else None
+        if path.rstrip("/") in ("/watch", "/watch/live") and one("v").isdigit():
+            return out("Meta", f"facebook:{one('v')}", f"https://www.facebook.com/watch/?v={one('v')}", one("v"))
+        m = re.match(r"/reel/(\d+)", path) or re.match(r"/(?:[\w.-]+/)?videos/(?:[\w.-]+/)?(\d{6,})", path)
+        if m:
+            return out("Meta", f"facebook:{m[1]}", f"https://www.facebook.com/watch/?v={m[1]}", m[1])
+        m = re.match(r"/share/([vrp])/([\w-]+)", path)
+        if m:
+            return out("Meta", f"url:fb-share-{m[1]}-{m[2]}", f"https://www.facebook.com/share/{m[1]}/{m[2]}/", "")
+        m = re.match(r"/[\w.-]+/posts/([\w-]+)", path)
+        if m:
+            return out("Meta", f"facebook-post:{m[1]}", f"https://www.facebook.com{m[0]}/", m[1])
+        if path.startswith("/permalink.php") and one("story_fbid"):
+            return out("Meta", f"facebook-post:{one('story_fbid')}", f"https://www.facebook.com/permalink.php?story_fbid={one('story_fbid')}&id={one('id')}", one("story_fbid"))
+        return None
+    if h == "youtu.be":
+        vid = path.strip("/").split("/")[0]
+        return out("YouTube", f"youtube:{vid}", f"https://www.youtube.com/watch?v={vid}", vid) if re.fullmatch(r"[\w-]{11}", vid) else None
+    if h.endswith("youtube.com"):
+        m = re.match(r"/(shorts|embed|live)/([\w-]{11})", path)
+        if m:
+            return out("YouTube", f"youtube:{m[2]}", (f"https://www.youtube.com/shorts/{m[2]}" if m[1] == "shorts" else
+                                                      f"https://www.youtube.com/watch?v={m[2]}"), m[2])
+        if path.rstrip("/") == "/watch" and re.fullmatch(r"[\w-]{11}", one("v")):
+            return out("YouTube", f"youtube:{one('v')}", f"https://www.youtube.com/watch?v={one('v')}", one("v"))
+        return None
+    if h in ("x.com", "twitter.com", "mobile.twitter.com", "www.x.com", "www.twitter.com", "mobile.x.com"):
+        m = re.match(r"/([\w]{1,15})/status(?:es)?/(\d{5,})", path)
+        return out("X", f"x:{m[2]}", f"https://x.com/{m[1]}/status/{m[2]}", m[2]) if m else None
+    if h.endswith("snapchat.com"):
+        m = re.match(r"/spotlight/([\w-]{10,})", path)
+        if m:
+            return out("Snapchat", f"snapchat:{m[1]}", f"https://www.snapchat.com/spotlight/{m[1]}", m[1])
+        if path.startswith("/t/") or h.startswith("story."):
+            return out("Snapchat", "url:" + h + path.rstrip("/"), f"https://{h}{path}", "")
+        return None
+    if h == "pin.it":
+        return out("Pinterest", "url:pin.it" + path.rstrip("/"), f"https://pin.it{path}", "") if len(path) > 2 else None
+    if re.search(r"(^|\.)pinterest\.[a-z.]+$", h):
+        m = re.match(r"/pin/(?:[\w-]*--)?(\d{6,})", path)
+        return out("Pinterest", f"pinterest:{m[1]}", f"https://www.pinterest.com/pin/{m[1]}/", m[1]) if m else None
+    if h.endswith("linkedin.com"):
+        m = re.search(r"urn:li:(?:activity|ugcPost):(\d+)", path) or re.search(r"activity-(\d{10,})", path)
+        if m:
+            return out("LinkedIn", f"linkedin:{m[1]}", f"https://www.linkedin.com/feed/update/urn:li:activity:{m[1]}/", m[1])
+        return None
+    return None
+
+
+def _ytdlp_opts(td: str) -> dict:
+    h264 = "[vcodec~='^(avc|h264)']"             # browsers play h264 everywhere; TikTok's h265 doesn't play in Chrome
+    return {"outtmpl": f"{td}/v.%(ext)s", "quiet": True, "no_warnings": True, "noplaylist": True, "playlist_items": "1",
+            "format": (f"bv*[height<=1080][ext=mp4]{h264}+ba[ext=m4a]/b[height<=1080][ext=mp4]{h264}/"
+                       "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]/b"),
+            "merge_output_format": "mp4", "max_filesize": MAX_BYTES, "socket_timeout": 30, "retries": 2,
+            "ffmpeg_location": FFMPEG}
 
 
 def fetch_source(url: str) -> tuple[bytes, str, dict]:
-    """-> (video bytes, content type, source facts). Raises with a short reason."""
+    """-> (video bytes, content type, source facts). Raises with yt-dlp's reason (explain() makes it human)."""
     import tempfile
     import yt_dlp
     with tempfile.TemporaryDirectory() as td:
-        opts = {"outtmpl": f"{td}/v.%(ext)s", "quiet": True, "no_warnings": True, "noplaylist": True,
-                "format": "best[ext=mp4][height<=1080]/bv*[ext=mp4][height<=1080]+ba[ext=m4a]/best[height<=1080]/best",
-                "merge_output_format": "mp4", "max_filesize": MAX_BYTES, "socket_timeout": 30, "retries": 2,
-                "ffmpeg_location": "/usr/local/bin/ffmpeg"}
-        try:
-            from yt_dlp.networking.impersonate import ImpersonateTarget   # TikTok needs a browser-like client
+        opts = _ytdlp_opts(td)
+        try:                                     # TikTok (and sometimes Instagram) need a browser-like client: curl_cffi
+            import curl_cffi  # noqa: F401,PLC0415
+            from yt_dlp.networking.impersonate import ImpersonateTarget
             opts["impersonate"] = ImpersonateTarget("chrome")
         except Exception:  # noqa: BLE001
             pass
-        with yt_dlp.YoutubeDL(opts) as y:
-            try:
+        try:
+            with yt_dlp.YoutubeDL(opts) as y:
                 info = y.extract_info(url, download=True)
-            except Exception:  # noqa: BLE001
-                opts.pop("impersonate", None)
-                with yt_dlp.YoutubeDL(opts) as y2:
-                    info = y2.extract_info(url, download=True)
+        except Exception:  # noqa: BLE001
+            if "impersonate" not in opts:
+                raise
+            opts.pop("impersonate")
+            with yt_dlp.YoutubeDL(opts) as y2:
+                info = y2.extract_info(url, download=True)
         if info.get("entries"):
             info = (info["entries"] or [{}])[0]
         files = sorted(pathlib.Path(td).glob("v.*"), key=lambda f: f.stat().st_size, reverse=True)
@@ -152,34 +298,150 @@ def fetch_source(url: str) -> tuple[bytes, str, dict]:
                  ".png": "image/png", ".webp": "image/webp"}.get(f.suffix.lower(), "video/mp4")
         facts = {k: info.get(k) for k in ("webpage_url", "uploader", "uploader_id", "uploader_url", "channel", "title",
                                           "description", "view_count", "like_count", "comment_count", "repost_count",
-                                          "upload_date", "timestamp", "duration", "track", "artist", "thumbnail")
+                                          "upload_date", "timestamp", "duration", "track", "artist", "thumbnail",
+                                          "width", "height", "id")
                  if info.get(k) not in (None, "")}
         return f.read_bytes(), ctype, facts
 
 
-def _fetch_job(aid: str, url: str) -> None:
+def explain(err: Exception | str) -> tuple[str, bool]:
+    """yt-dlp / network error -> (a reason a person understands, worth retrying?)."""
+    e = str(err).lower()
+    rules = [
+        (("unsupported url",), "This kind of link isn't supported - open the post itself and save from there", False),
+        (("private", "only available for registered", "this account is private"), "The post is private", False),
+        (("login required", "log in", "requires authentication", "use --cookies", "cookies"),
+         "The site wants a login to show this post (common on Instagram/Facebook) - we'll keep the screenshot", False),
+        (("not available", "removed", "deleted", "does not exist", "404", "no video in that post", "no video formats"),
+         "The post was deleted, isn't public, or has no video", False),
+        (("larger than max-filesize", "file too big", "max-filesize"), "The video is over 120 MB", False),
+        (("impersonat", "curl_cffi"), "TikTok blocked the download (the server needs curl_cffi) - retrying", True),
+        (("429", "rate", "too many requests"), "The site is rate-limiting us - retrying in a bit", True),
+        (("timed out", "timeout", "connection", "temporarily", "403", "blocked", "502", "503", "network"),
+         "The site didn't answer (network / blocked) - retrying", True),
+    ]
+    for keys, msg, retry in rules:
+        if any(k in e for k in keys):
+            return msg, retry
+    return "Couldn't download it: " + str(err).strip().splitlines()[0][:140] if str(err).strip() else "Couldn't download it", True
+
+
+def _set(aid: str, status: str, **extra) -> None:
+    a = q("select extra from ads where id=?", (aid,), one=True)
+    if not a:
+        return
+    ex = {**json.loads(a["extra"] or "{}"), **extra,
+          "fetch": {"done": "done", "failed": "failed"}.get(status, "working")}      # old Studio pages read extra.fetch
+    q("update ads set status=?, extra=? where id=?", (status, json.dumps(ex), aid))
+
+
+def _thumb(video_path: str) -> str:
+    """First-second frame of a video as a jpg next to it ("" if ffmpeg isn't there)."""
+    import subprocess
+    out = str(pathlib.Path(video_path).with_suffix(".jpg"))
     try:
-        data, ctype, facts = fetch_source(url)
-        a = q("select * from ads where id=?", (aid,), one=True) or {}
-        path, kind, sha = store(data, ctype, a.get("platform") or platform_of(url))
+        if not pathlib.Path(out).exists():
+            subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-ss", "0.5", "-i", video_path, "-frames:v", "1",
+                            "-vf", "scale='min(720,iw)':-2", out], timeout=60, check=True, capture_output=True)
+        return out if pathlib.Path(out).exists() else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+_wake = threading.Event()
+_job_lk = threading.Lock()
+
+
+def enqueue(aid: str, mode: str, url: str, media_url: str = "", referer: str = "") -> str:
+    jid = _id()
+    now = time.time()
+    q("insert into jobs(id, ad_id, mode, url, media_url, referer, status, tries, error, created, updated, next_at) "
+      "values(?,?,?,?,?,?,?,?,?,?,?,?)", (jid, aid, mode, url, media_url, referer, "queued", 0, "", now, now, 0))
+    _set(aid, "queued")
+    _wake.set()
+    return jid
+
+
+def work_once() -> bool:
+    """Runs ONE due download job (yt-dlp for post links, a plain download for a video file's own address).
+    -> False when nothing was due. The workers loop on this; the tests call it directly."""
+    with _job_lk:
+        j = q("select * from jobs where status='queued' and next_at<=? order by created limit 1", (time.time(),), one=True)
+        if not j:
+            return False
+        q("update jobs set status='downloading', tries=tries+1, updated=? where id=?", (time.time(), j["id"]))
+    aid = j["ad_id"]
+    a = q("select * from ads where id=?", (aid,), one=True)
+    if not a:
+        q("update jobs set status='gone', updated=? where id=?", (time.time(), j["id"]))
+        return True
+    _set(aid, "downloading")
+    try:
+        if j["mode"] == "direct":
+            data, ctype = _download(j["media_url"], j["referer"] or j["url"])
+            if "octet-stream" in ctype or not ctype:
+                ctype = "video/mp4"
+            facts = {}
+        else:
+            data, ctype, facts = fetch_source(j["url"])
+        path, kind, sha = store(data, ctype, a.get("platform") or platform_of(j["url"]))
         dup = q("select id from ads where sha=? and id<>?", (sha, aid), one=True)
-        if dup:
+        if dup:                                  # same file already in the library (saved from another link)
             q("delete from ads where id=?", (aid,))
-            return
-        extra = {**json.loads(a.get("extra") or "{}"), "fetch": "done", "source": facts}
+            q("delete from ad_folders where ad_id=?", (aid,))
+            q("update jobs set status='done', error=?, updated=? where id=?", ("duplicate of " + dup["id"], time.time(), j["id"]))
+            return True
+        ex = json.loads(a.get("extra") or "{}")
+        th = _thumb(path) if kind == "video" else ""
+        ex.update({"source": facts, **({"thumb": th} if th else {}), "fetched_from": j["mode"]})
         desc = str(facts.get("description") or facts.get("title") or "")
+        page = str(facts.get("webpage_url") or a.get("page_url") or j["url"])[:500]
         q("update ads set media=?, kind=?, sha=?, brand=coalesce(nullif(brand,''), ?), ad_text=coalesce(nullif(ad_text,''), ?), "
           "title=coalesce(nullif(title,''), ?), page_url=?, extra=? where id=?",
           (path, kind, sha, str(facts.get("uploader") or facts.get("channel") or "")[:120], desc[:2000],
-           str(facts.get("title") or "")[:200], str(facts.get("webpage_url") or url)[:500], json.dumps(extra), aid))
+           str(facts.get("title") or "")[:200], page, json.dumps(ex), aid))
         threading.Thread(target=_scan, args=(pathlib.Path(path).parent,), daemon=True).start()
+        _set(aid, "reading")
         ai_read(aid)
+        _set(aid, "done", fetch_error="")
+        q("update jobs set status='done', error='', updated=? where id=?", (time.time(), j["id"]))
     except Exception as e:  # noqa: BLE001
-        a = q("select extra, media from ads where id=?", (aid,), one=True) or {}
-        extra = {**json.loads(a.get("extra") or "{}"), "fetch": "failed", "fetch_error": str(e)[:200]}
-        q("update ads set extra=? where id=?", (json.dumps(extra), aid))
-        if a.get("media"):
-            ai_read(aid)       # the screenshot that came with it still gets read
+        reason, retry = explain(e)
+        tries = (j["tries"] or 0) + 1
+        if retry and tries < MAX_TRIES:
+            q("update jobs set status='queued', error=?, next_at=?, updated=? where id=?",
+              (reason, time.time() + 20 * tries * tries, time.time(), j["id"]))
+            _set(aid, "queued", fetch_error=reason, tries=tries)
+        else:
+            q("update jobs set status='failed', error=?, updated=? where id=?", (reason, time.time(), j["id"]))
+            _set(aid, "failed", fetch_error=reason, tries=tries)
+    return True
+
+
+def retry(aid: str) -> bool:
+    j = q("select * from jobs where ad_id=? order by created desc limit 1", (aid,), one=True)
+    if not j or j["status"] not in ("failed", "queued"):
+        return False
+    q("update jobs set status='queued', tries=0, next_at=0, error='', updated=? where id=?", (time.time(), j["id"]))
+    _set(aid, "queued", fetch_error="")
+    _wake.set()
+    return True
+
+
+def workers(n: int = 2) -> None:
+    q("update jobs set status='queued', next_at=0 where status='downloading'")       # a restart mid-download: run it again
+
+    def loop():
+        while True:
+            try:
+                if work_once():
+                    continue
+            except Exception:  # noqa: BLE001
+                time.sleep(2)
+            _wake.wait(5)
+            _wake.clear()
+    for _ in range(n):
+        threading.Thread(target=loop, daemon=True).start()
 
 
 # ---------- AI read ----------
@@ -199,7 +461,7 @@ def ai_read(aid: str) -> None:
         if a["kind"] == "video":
             import subprocess
             tmp = f"/tmp/adlib-{aid}.jpg"
-            subprocess.run(["/usr/local/bin/ffmpeg", "-y", "-loglevel", "error", "-ss", "1", "-i", src, "-frames:v", "1", tmp],
+            subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-ss", "1", "-i", src, "-frames:v", "1", tmp],
                            timeout=60, check=True)
             src = tmp
         im = Image.open(src).convert("RGB")
@@ -215,6 +477,9 @@ def ai_read(aid: str) -> None:
         q("update ads set ai=? where id=?", (m.group(0) if m else "{}", aid))
     except Exception as e:  # noqa: BLE001
         q("update ads set ai=? where id=?", (json.dumps({"summary": f"(couldn't read: {str(e)[:80]})"}), aid))
+    finally:
+        q("update ads set status='done' where id=? and status='reading' and not exists "
+          "(select 1 from jobs where ad_id=? and status in ('queued','downloading'))", (aid, aid))
 
 
 # ---------- Foreplay (while we still have it) ----------
@@ -374,14 +639,14 @@ def fp_import(ad: dict, by: str, tags: list | None = None, note: str = "") -> di
     dup = q("select id from ads where sha=?", (sha,), one=True)
     if dup:
         return {"id": dup["id"], "duplicate": True}
-    aid = _id()
     extra = {"foreplay": {k: ad.get(k) for k in ("transcript", "emotions", "persona", "niches", "category", "market",
                                                  "languages", "cta", "running", "live", "started", "foreplay_url",
                                                  "platform", "format", "brand_id", "ad_id")}}
-    q("insert into ads values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-        aid, time.time(), by, "foreplay", "Foreplay", str(ad.get("landing") or ad.get("foreplay_url") or "")[:500], path,
-        kind, sha, str(ad.get("headline") or "")[:200], str(ad.get("brand") or "")[:120], str(ad.get("text") or "")[:2000],
-        json.dumps([t[:30] for t in (tags or [])][:12]), note[:600], "", fid, json.dumps(extra)))
+    aid = insert_ad(by=by, source="foreplay", platform="Foreplay",
+                    page_url=str(ad.get("landing") or ad.get("foreplay_url") or "")[:500], media=path, kind=kind, sha=sha,
+                    title=str(ad.get("headline") or "")[:200], brand=str(ad.get("brand") or "")[:120],
+                    ad_text=str(ad.get("text") or "")[:2000], tags=json.dumps([t[:30] for t in (tags or [])][:12]),
+                    note=note[:600], foreplay_id=fid, extra=json.dumps(extra), status="done")
     threading.Thread(target=ai_read, args=(aid,), daemon=True).start()
     threading.Thread(target=_scan, args=(pathlib.Path(path).parent,), daemon=True).start()
     return {"id": aid}
@@ -460,35 +725,17 @@ async def save(request: Request):
     page = str(form.get("page_url") or "")[:500]
     plat = str(form.get("platform") or "") or platform_of(page or str(form.get("media_url") or ""))
     data, ctype = None, ""
-    want = str(form.get("fetch") or "") == "1" and fetchable(page)
-    if str(form.get("fetch") or "") == "1" and not want and not (form.get("data_url") or form.get("file") or form.get("media_url")):
-        return JSONResponse({"error": "paste a TikTok, Instagram, Facebook, YouTube or X post link"}, status_code=400)
-    if want:   # the real video + its source, downloaded in the background (a screenshot may come along as a fallback)
-        same = q("select id from ads where page_url=? and media<>''", (page,), one=True)
-        if same:
-            return JSONResponse({"id": same["id"], "duplicate": True})
-        aid = _id()
-        shot_path, shot_kind, shot_sha = "", "", ""
-        if form.get("data_url"):
-            m = re.match(r"data:([\w/+.-]+);base64,(.*)", str(form.get("data_url")), re.S)
-            if m:
-                try:
-                    shot_path, shot_kind, shot_sha = store(base64.b64decode(m.group(2)), m.group(1), plat)
-                except ValueError:
-                    pass
-        q("insert into ads values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-            aid, time.time(), by, str(form.get("source") or "extension")[:20], plat[:30], page, shot_path, shot_kind,
-            shot_sha or f"pending-{aid}", str(form.get("title") or "")[:200], str(form.get("brand") or "")[:120],
-            str(form.get("ad_text") or "")[:2000],
-            json.dumps(_clean_tags(str(form.get("tags") or ""))),
-            str(form.get("note") or "")[:600], "", "", json.dumps({"fetch": "working"})))
-        threading.Thread(target=_fetch_job, args=(aid, page), daemon=True).start()
-        if form.get("folder"):
-            try:
-                folder_put(str(form.get("folder")), [aid])
-            except ValueError:
-                pass
-        return JSONResponse({"id": aid, "fetching": True, "platform": plat})
+    target = str(form.get("post_url") or "") or page
+    media_url = str(form.get("media_url") or "")
+    c = canonical(target)
+    if str(form.get("fetch") or "") == "1":
+        direct_ok = media_url.startswith(("https://", "http://"))
+        if c and (not c["direct"] or direct_ok) or (direct_ok and not c):
+            return _queue_save(form, by, c, target, page, media_url if direct_ok else "")
+        if not (form.get("data_url") or form.get("file")):
+            return JSONResponse({"error": "That isn't a post link. Open the post itself (TikTok, Instagram, Facebook, YouTube, "
+                                          "X, Snapchat, Pinterest or the Meta Ad Library) and save from there."}, status_code=400)
+        # not a post (a landing page, a feed...) but a screenshot came along: keep that picture
     f = form.get("file")
     if f is not None and getattr(f, "filename", None):
         data, ctype = await f.read(), f.content_type or "application/octet-stream"
@@ -524,12 +771,11 @@ async def save(request: Request):
     dup = q("select id from ads where sha=?", (sha,), one=True)
     if dup:
         return JSONResponse({"id": dup["id"], "duplicate": True})
-    aid = _id()
-    q("insert into ads values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-        aid, time.time(), by, str(form.get("source") or "extension")[:20], plat[:30], page, path, kind, sha,
-        str(form.get("title") or "")[:200], str(form.get("brand") or "")[:120], str(form.get("ad_text") or "")[:2000],
-        json.dumps(_clean_tags(str(form.get("tags") or ""))),
-        str(form.get("note") or "")[:600], "", str(form.get("foreplay_id") or ""), "{}"))
+    aid = insert_ad(by=by, source=str(form.get("source") or "extension")[:20], platform=plat[:30], page_url=page, media=path,
+                    kind=kind, sha=sha, title=str(form.get("title") or "")[:200], brand=str(form.get("brand") or "")[:120],
+                    ad_text=str(form.get("ad_text") or "")[:2000], tags=json.dumps(_clean_tags(str(form.get("tags") or ""))),
+                    note=str(form.get("note") or "")[:600], foreplay_id=str(form.get("foreplay_id") or ""),
+                    status="reading")            # no canon: a picture of a post must not block saving its real video later
     threading.Thread(target=ai_read, args=(aid,), daemon=True).start()
     threading.Thread(target=_scan, args=(pathlib.Path(path).parent,), daemon=True).start()
     if form.get("folder"):
@@ -537,7 +783,100 @@ async def save(request: Request):
             folder_put(str(form.get("folder")), [aid])
         except ValueError:
             pass
-    return JSONResponse({"id": aid, "kind": kind, "platform": plat})
+    return JSONResponse({"id": aid, "kind": kind, "platform": plat, "status": "reading"})
+
+
+def _shot(form, plat: str) -> str:
+    """The screenshot / crop the extension sends along -> its path (thumbnail + fallback only)."""
+    m = re.match(r"data:([\w/+.-]+);base64,(.*)", str(form.get("data_url") or ""), re.S)
+    if not m:
+        return ""
+    try:
+        return store(base64.b64decode(m.group(2)), m.group(1), plat)[0]
+    except (ValueError, base64.binascii.Error):
+        return ""
+
+
+def _queue_save(form, by: str, c: dict | None, target: str, page: str, media_url: str):
+    """A post link (or a video file's own address) -> one row "queued" + a download job. Same post twice = the first save
+    (a failed one is simply tried again)."""
+    plat = str(form.get("platform") or "") or (c or {}).get("platform") or platform_of(target or media_url)
+    key = c["key"] if c else "media:" + re.sub(r"[?#].*$", "", media_url)[:400]
+    old = q("select id, status from ads where canon=? order by ts limit 1", (key,), one=True) or \
+        (q("select id, status from ads where page_url=? and kind='video' and media<>'' limit 1", (c["url"],), one=True) if c else None)
+    if old:
+        if old["status"] == "failed" and retry(old["id"]):
+            return JSONResponse({"id": old["id"], "status": "queued", "fetching": True, "retrying": True, "platform": plat})
+        return JSONResponse({"id": old["id"], "duplicate": True, "status": old["status"] or "done", "platform": plat})
+    extra = {"saved_from": page[:500]} if page and page != (c or {}).get("url") else {}
+    shot = _shot(form, plat)
+    if shot:
+        extra["thumb"] = shot
+    for k in ("author", "post_id", "detected"):
+        if form.get(k):
+            extra[k] = str(form.get(k))[:200]
+    aid = insert_ad(by=by, source=str(form.get("source") or "extension")[:20], platform=plat[:30],
+                    page_url=(c["url"] if c else page or media_url)[:500], kind="video", sha=f"pending-{_id()}",
+                    title=str(form.get("title") or "")[:200], brand=str(form.get("brand") or "")[:120],
+                    ad_text=str(form.get("ad_text") or "")[:2000], tags=json.dumps(_clean_tags(str(form.get("tags") or ""))),
+                    note=str(form.get("note") or "")[:600], extra=json.dumps(extra), canon=key, status="queued")
+    if c and not (c["direct"] and media_url):
+        enqueue(aid, "ytdlp", c["url"])
+    else:
+        enqueue(aid, "direct", c["url"] if c else page, media_url, page)
+    if form.get("folder"):
+        try:
+            folder_put(str(form.get("folder")), [aid])
+        except ValueError:
+            pass
+    return JSONResponse({"id": aid, "status": "queued", "fetching": True, "platform": plat})
+
+
+def status_of(ids: list) -> list:
+    ids = [i for i in ids if re.fullmatch(r"[\w-]{1,40}", i)][:50]
+    if not ids:
+        return []
+    rows = q(f"select id, ts, by, platform, page_url, kind, media, title, brand, status, extra, ai from ads where id in "
+             f"({','.join('?' * len(ids))})", tuple(ids))
+    by_id = {r["id"]: r for r in rows}
+    out = []
+    for i in ids:
+        r = by_id.get(i)
+        if not r:                                 # merged into an older copy of the same file, or deleted
+            j = q("select error from jobs where ad_id=? order by created desc limit 1", (i,), one=True)
+            dup = (j or {}).get("error", "")
+            out.append({"id": i, "status": "done" if dup.startswith("duplicate of ") else "gone",
+                        **({"same_as": dup.split()[-1]} if dup.startswith("duplicate of ") else {})})
+            continue
+        ex = json.loads(r["extra"] or "{}")
+        ai = json.loads(r["ai"] or "{}")
+        out.append({"id": i, "status": r["status"] or ("done" if r["media"] else "queued"), "error": ex.get("fetch_error", ""),
+                    "kind": r["kind"], "platform": r["platform"], "title": (ai.get("summary") or r["title"] or "")[:140],
+                    "brand": r["brand"], "page_url": r["page_url"], "ts": r["ts"], "has_media": bool(r["media"]),
+                    "has_thumb": bool(ex.get("thumb")), "tries": ex.get("tries", 0)})
+    return out
+
+
+@guard
+async def status(request: Request):
+    return JSONResponse({"items": status_of(request.query_params.get("ids", "").split(","))})
+
+
+@guard
+async def retry_ep(request: Request):
+    aid = request.path_params["aid"]
+    return JSONResponse({"ok": retry(aid), "items": status_of([aid])})
+
+
+@guard
+async def thumb(request: Request):
+    a = q("select media, kind, extra from ads where id=?", (request.path_params["aid"],), one=True)
+    if not a:
+        return Response(status_code=404)
+    t = json.loads(a["extra"] or "{}").get("thumb") or (a["media"] if a["kind"] == "image" else "")
+    if not t or not pathlib.Path(t).is_file():
+        return Response(status_code=404)
+    return FileResponse(t)
 
 
 @guard
@@ -553,6 +892,11 @@ async def items(request: Request):
     if qp.get("by"):
         where.append("by=?")
         args.append(qp["by"])
+    if qp.get("status") == "working":
+        where.append("status in ('queued','downloading','reading')")
+    elif qp.get("status"):
+        where.append("status=?")
+        args.append(qp["status"])
     src = qp.get("source", "library")           # library = our own saves (extension, phone bots, uploads) - the default
     if src == "library":
         where.append("source<>'foreplay'")
@@ -765,6 +1109,8 @@ async def health(request):
 
 app = Starlette(routes=[Route("/health", health), Route("/v1/save", save, methods=["POST"]), Route("/v1/items", items),
                         Route("/v1/items/{aid}", item, methods=["GET", "PATCH", "DELETE"]), Route("/v1/media/{aid}", media),
+                        Route("/v1/thumb/{aid}", thumb), Route("/v1/status", status),
+                        Route("/v1/retry/{aid}", retry_ep, methods=["POST"]),
                         Route("/v1/foreplay/search", foreplay),
                         Route("/v1/folders", folders, methods=["GET", "POST"]),
                         Route("/v1/folders/{fid}", folder, methods=["PATCH", "DELETE"]),
@@ -777,4 +1123,5 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "sync":      # daily timer: ad-library-sync
         print(json.dumps(fp_sync("daily sync")))
         raise SystemExit(0)
+    workers(int(os.getenv("LIBRARY_WORKERS", "2")))
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")

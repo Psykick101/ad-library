@@ -1,24 +1,38 @@
 <!doctype html><html><head><meta charset="utf-8"><style>
-body{width:300px;margin:0;font:14px system-ui,sans-serif;background:#0f1216;color:#e6eaef}
-.h{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid #262e38;font-weight:600}
-.h i{width:10px;height:10px;border-radius:50%;background:#7cc4a8}
+:root{--bg:#0f1216;--card:#161b21;--line:#262e38;--fg:#e6eaef;--mut:#8b96a3;--acc:#7cc4a8;--ink:#0f1216;--bad:#e58c8c;--warn:#e6c07b;--blue:#7fb0ea}
+[hidden]{display:none!important}
+body{width:340px;margin:0;font:14px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+.h{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--line);font-weight:600}
+.h i{width:10px;height:10px;border-radius:50%;background:var(--acc)}.h .who{margin-left:auto;font-weight:400;font-size:12px;color:var(--mut);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .b{padding:12px 14px;display:flex;flex-direction:column;gap:8px}
-button{font:600 14px system-ui;border:0;border-radius:10px;padding:10px;cursor:pointer;background:#7cc4a8;color:#0f1216}
-button.s{background:#1b2129;color:#e6eaef;border:1px solid #262e38}
-input{font:14px system-ui;background:#161b21;border:1px solid #262e38;color:#e6eaef;border-radius:8px;padding:8px}
-a{color:#7cc4a8}.m{color:#8b96a3;font-size:12px}
-.f{border-top:1px solid #262e38;padding:8px 14px;font-size:12px;color:#8b96a3;display:flex;flex-direction:column;gap:6px}
-.f b{color:#e6eaef}.f button{padding:7px;font-size:13px}
+button{font:600 14px system-ui;border:0;border-radius:10px;padding:10px;cursor:pointer;background:var(--acc);color:var(--ink)}
+button.s{background:#1b2129;color:var(--fg);border:1px solid var(--line)}button:disabled{opacity:.45;cursor:default}
+button.l{background:none;border:0;color:var(--acc);padding:0;font:12px system-ui;cursor:pointer}
+input{font:14px system-ui;background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:8px}
+a{color:var(--acc)}.m{color:var(--mut);font-size:12px;margin:0;line-height:1.45}
+.cn{border:1px solid #2f5d4d;background:#13201b;border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px}
+.cn b{font-size:15px}
+h4{margin:6px 0 0;font-size:12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+#rec{display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}
+.it{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:12px;display:flex;flex-direction:column;gap:3px}
+.it .t{color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.it .r{display:flex;gap:6px;align-items:center}
+.pill{font-weight:700;font-size:11px;border-radius:999px;padding:2px 8px;background:#222a33;color:var(--mut)}
+.pill.queued,.pill.downloading,.pill.reading{color:var(--blue);background:#17263a}.pill.done{color:var(--acc);background:#13201b}
+.pill.failed,.pill.gone{color:var(--bad);background:#2a1616}.err{color:var(--bad)}
+.f{border-top:1px solid var(--line);padding:8px 14px;font-size:12px;color:var(--mut);display:flex;flex-direction:column;gap:6px}
+.f b{color:var(--fg)}.f button{padding:7px;font-size:13px}
 </style></head><body>
-<div class="h"><i></i>Save to Psykick Studio</div>
+<div class="h"><i></i>Save to Psykick Studio<span class="who" id="who"></span></div>
 <div class="b">
-  <button id="post">Save this post's video (with source)</button>
-  <button class="s" id="area">Select an area and save</button>
-  <button class="s" id="shot">Save what's on screen</button>
-  <input id="tags" placeholder="Tags (comma separated, optional)">
+  <div class="cn" id="cn" hidden><b>Connect to the Studio</b><span class="m">One time per browser: a Studio tab opens, press <b>Connect</b> there. Then every save goes straight into Inspiration under your name.</span><button id="connect">Connect</button></div>
+  <button id="post" disabled>Save this page's video</button>
+  <button class="s" id="area">Select an area (or click a video)</button>
+  <button class="s" id="shot">Save this page (screenshot + link)</button>
+  <input id="tags" placeholder="Labels (comma separated, optional)">
   <input id="note" placeholder="Why it's interesting (optional)">
-  <p class="m">Tip: right-click any image or video → "Save to Psykick Studio". On TikTok, Instagram, Facebook, YouTube and X the real video is downloaded with its author, caption, stats and link. Shortcut: Alt+Shift+S.</p>
-  <a href="https://studio.psykick.cc/studio#inspiration" target="_blank">Open the library</a>
+  <p class="m">Videos are found by their post link and downloaded for real, with author, caption and stats. Right-click any video → <b>Save this video</b>. Shortcut: <b>Alt+Shift+S</b>.</p>
+  <h4 id="rech" hidden>Your recent saves</h4><div id="rec"></div>
+  <a id="lib" href="#" target="_blank">Open Inspiration</a>
 </div>
 <div class="f" id="upd"></div>
 <script src="popup.js"></script></body></html>
