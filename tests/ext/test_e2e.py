@@ -39,14 +39,38 @@ STUDIO = f"http://localhost:{SP}"
 os.environ.update(LAB_TEST="1", LAB_DB=str(T / "lab.db"), WS_ROOT=str(T / "ws"), STUDIO_LOCK=str(T / "lock"),
                   LIBRARY_KEY_FILE=str(T / "lib.key"), STUDIO_HOSTS="localhost", LIBRARY_URL=f"http://127.0.0.1:{LP}",
                   LIBRARY_DB=str(T / "library.db"), LIBRARY_MEDIA=str(T / "media"), LIBRARY_KEY=str(T / "lib.key"),
-                  FOREPLAY_ENV=str(T / "fp.env"), STUDIO_CREATIVE=str(T / "creative"))
+                  FOREPLAY_ENV=str(T / "fp.env"), STUDIO_CREATIVE=str(T / "creative"), LIBRARY_VAULT=str(T / "vault"),
+                  LIBRARY_VAULT_KEY=str(T / "vault.key"), ACCOUNT_GAP_MIN="0", ACCOUNT_GAP_MAX="1")
 sys.path.insert(0, str(REPO))
 sys.path.insert(1, str(STUDIO_SRC))
 import uvicorn  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
+import httpx  # noqa: E402
+
+import accounts as A  # noqa: E402
 import library_service as L  # noqa: E402
 import lab_app as la  # noqa: E402
+import saver  # noqa: E402
+
+IG_SEEN = []
+
+
+def fake_instagram(req):                     # instagram.com as the saver account sees it (saved answers)
+    IG_SEEN.append(str(req.url))
+    u = str(req.url)
+    if "current_user" in u:
+        return httpx.Response(200, json={"user": {"username": "psykick.saver"}})
+    if "direct_v2/inbox" in u:
+        return httpx.Response(200, json=json.loads((REPO / "tests" / "fixtures" / "ig_inbox.json").read_text()))
+    if "pending_inbox" in u:
+        return httpx.Response(200, json=json.loads((REPO / "tests" / "fixtures" / "ig_pending.json").read_text()))
+    return httpx.Response(200, json={"status": "ok"})
+
+
+A.TRANSPORT = httpx.MockTransport(fake_instagram)
+saver.LIBRARY = la.LIBRARY
+saver.LIB_KEY = T / "lib.key"
 
 ok = n = 0
 
@@ -68,7 +92,7 @@ release, fetched = threading.Event(), []
 def fake_fetch(url):
     fetched.append(url)
     release.wait(90)
-    return VID.read_bytes(), "video/mp4", {"webpage_url": url, "uploader": "glowskin.th", "description": "Serum that actually works ✨",
+    return VID.read_bytes() + url.encode(), "video/mp4", {"webpage_url": url, "uploader": "glowskin.th", "description": "Serum that actually works ✨",
                                            "view_count": 128000, "like_count": 12400, "upload_date": "20261020"}
 
 
@@ -300,6 +324,50 @@ with sync_playwright() as pw:
     job = L.q("select url from jobs where ad_id=?", (r.get("id"),), one=True) or {}
     case("'Save this page's video' on a Reel -> queued with the reel link", r.get("ok") and
          job.get("url") == "https://www.instagram.com/reel/C9QwErTyUi3/", (r, job))
+
+    # 7b. admin: connect the company's Instagram saver account from the extension (only 3 cookies leave the browser)
+    SESSION = "61000000001%3AsEcReTsEsSiOn%3A27"
+    ctx.add_cookies([{"name": "sessionid", "value": SESSION, "domain": ".instagram.com", "path": "/", "secure": True, "expires": 1830000000},
+                     {"name": "ds_user_id", "value": "61000000001", "domain": ".instagram.com", "path": "/", "secure": True, "expires": 1830000000},
+                     {"name": "csrftoken", "value": "csrfABC", "domain": ".instagram.com", "path": "/", "secure": True, "expires": 1830000000},
+                     {"name": "ig_did", "value": "NOT-SENT", "domain": ".instagram.com", "path": "/", "secure": True, "expires": 1830000000}])
+    pop = ctx.new_page()
+    pop.set_viewport_size({"width": 360, "height": 760})
+    pop.goto(f"chrome-extension://{eid}/popup.html")
+    pop.wait_for_selector("#adm:not([hidden])")
+    pop.click("#adm summary")
+    pop.click("#sv-ig")
+    pop.wait_for_selector("#sv-st.okk", timeout=20000)
+    case("popup (admin): Connect as saver account -> connected as @psykick.saver", "@psykick.saver" in pop.inner_text("#sv-st"))
+    pop.screenshot(path=str(OUT / "12-popup-saver-account.png"))
+    kept = A.load("instagram")
+    case("library got exactly the 3 needed cookies, encrypted at rest", sorted(c["name"] for c in kept) == ["csrftoken", "ds_user_id", "sessionid"]
+         and SESSION.encode() not in (T / "vault" / "instagram.enc").read_bytes())
+
+    # 7c. the team shares posts to it: one DM pass (saved inbox) -> saved under the linked person, "via Instagram DM"
+    saver.ig_link_handle(OWNER, "dana.creates")
+    saver.set_setting("ig_dm_since", 0)
+    res = saver.dm_poll_once()
+    case("DM pass: 6 posts from the linked sender saved; 2 unknown senders kept aside", res["saved"] == 6 and res["unknown"] == 2, res)
+    case("replies went back through the saver account", any("broadcast/text" in u for u in IG_SEEN))
+    for _ in range(150):
+        if not L.q("select 1 from jobs where status in ('queued','downloading')"):
+            break
+        time.sleep(0.2)
+    rows = L.q("select * from ads where source='instagram-dm'")
+    case("DM saves: downloaded, with who sent it", rows and all(json.loads(r["extra"]).get("sender") == "@dana.creates" for r in rows))
+    st.bring_to_front()
+    st.evaluate("() => show('inspiration')")
+    st.select_option("#il-via", "instagram")
+    st.wait_for_selector(".via a[data-snd]", timeout=15000)
+    case("Inspiration: 'via Instagram DM @dana.creates' + filter", "via Instagram DM" in st.inner_text("#il-grid"))
+    st.screenshot(path=str(OUT / "13-inspiration-instagram-dm.png"))
+    st.evaluate("() => show('settings')")
+    st.wait_for_selector("#src-acc .dot.ok", timeout=10000)
+    case("Settings: saver account status + unknown sender waiting", "psykick.saver" in st.inner_text("#src-acc")
+         and "stranger.x" in st.inner_text("#src-unk") and "@psykick.saver" in st.inner_text("#ig-how"))
+    st.locator("#ig-box").screenshot(path=str(OUT / "14-settings-save-from-instagram.png"))
+    st.locator("#src-box").screenshot(path=str(OUT / "15-settings-inspiration-sources.png"))
 
     # 8. disconnect in the popup -> token revoked server side; the next save asks to connect again
     pop = ctx.new_page()

@@ -1,0 +1,27 @@
+{"viewer": {"pk": "61000000001", "pk_id": "61000000001", "username": "psykick.saver", "full_name": "Psykick Saver"},
+ "inbox": {"threads": [
+  {"thread_id": "340282366841710300949128100000000001", "thread_title": "dana.creates", "pending": false,
+   "users": [{"pk": "5500001", "pk_id": "5500001", "username": "dana.creates", "full_name": "Dana K"}],
+   "items": [
+    {"item_id": "3100000000000000000000000000001", "user_id": 5500001, "timestamp": 1761550000000000, "item_type": "clip",
+     "clip": {"clip": {"pk": "3456", "code": "DBreelCode1", "media_type": 2, "product_type": "clips", "user": {"username": "glowskin.th"}}}},
+    {"item_id": "3100000000000000000000000000002", "user_id": 5500001, "timestamp": 1761550010000000, "item_type": "media_share",
+     "media_share": {"pk": "3457", "code": "DBpostCode2", "media_type": 1, "product_type": "feed"}},
+    {"item_id": "3100000000000000000000000000003", "user_id": 5500001, "timestamp": 1761550020000000, "item_type": "xma_media_share",
+     "xma_media_share": [{"target_url": "https://www.instagram.com/p/DBxmaCode3/?img_index=1", "title_text": "brand.one", "preview_url": "https://scontent.cdninstagram.com/x.jpg"}]},
+    {"item_id": "3100000000000000000000000000004", "user_id": 5500001, "timestamp": 1761550030000000, "item_type": "link",
+     "link": {"text": "look at this https://www.tiktok.com/@brand.x/video/7412345678901234567?lang=en", "link_context": {"link_url": "https://www.tiktok.com/@brand.x/video/7412345678901234567?lang=en", "link_title": "TikTok"}}},
+    {"item_id": "3100000000000000000000000000005", "user_id": 61000000001, "timestamp": 1761550040000000, "item_type": "text", "text": "Saved ✅ to Inspiration"},
+    {"item_id": "3100000000000000000000000000006", "user_id": 5500001, "timestamp": 1761550050000000, "item_type": "text", "text": "great hook! https://www.youtube.com/shorts/dQw4w9WgXcQ"},
+    {"item_id": "3100000000000000000000000000007", "user_id": 5500001, "timestamp": 1761550060000000, "item_type": "story_share", "story_share": {"media": {"code": "STORY1"}}},
+    {"item_id": "3100000000000000000000000000008", "user_id": 5500001, "timestamp": 1761550070000000, "item_type": "xma_clip",
+     "xma_clip": [{"target_url": "https://www.instagram.com/reel/DBxmaClip4/", "title_text": "fit.coach"}]}
+   ]},
+  {"thread_id": "340282366841710300949128100000000002", "thread_title": "new.hire", "pending": false,
+   "users": [{"pk": "5500002", "username": "new.hire", "full_name": "New Hire"}],
+   "items": [
+    {"item_id": "3100000000000000000000000000010", "user_id": 5500002, "timestamp": 1761550100000000, "item_type": "text", "text": "K7QM2P"},
+    {"item_id": "3100000000000000000000000000011", "user_id": 5500002, "timestamp": 1761550110000000, "item_type": "clip",
+     "clip": {"clip": {"code": "DBreelCode5", "product_type": "clips"}}}
+   ]}
+ ]}}

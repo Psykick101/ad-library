@@ -17,6 +17,7 @@ Foreplay key (optional): /etc/ai-secrets/foreplay.env FOREPLAY_API_KEY=...; mont
 (default 8000 - stays inside the 10,000 credits every Foreplay plan includes).
 """
 import base64
+import contextlib
 import datetime as dt
 import hashlib
 import io
@@ -31,6 +32,8 @@ import uuid
 
 import httpx
 import uvicorn
+
+import accounts
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
@@ -271,8 +274,12 @@ def fetch_source(url: str) -> tuple[bytes, str, dict]:
     """-> (video bytes, content type, source facts). Raises with yt-dlp's reason (explain() makes it human)."""
     import tempfile
     import yt_dlp
-    with tempfile.TemporaryDirectory() as td:
+    acct = accounts.platform_for(url)
+    use = bool(acct) and accounts.usable(acct)
+    with tempfile.TemporaryDirectory() as td, (accounts.cookie_file(acct) if use else contextlib.nullcontext()) as ck:
         opts = _ytdlp_opts(td)
+        if ck:                                   # Instagram / Facebook: as the company's saver account
+            opts["cookiefile"] = ck
         try:                                     # TikTok (and sometimes Instagram) need a browser-like client: curl_cffi
             import curl_cffi  # noqa: F401,PLC0415
             from yt_dlp.networking.impersonate import ImpersonateTarget
@@ -310,8 +317,11 @@ def explain(err: Exception | str) -> tuple[str, bool]:
     rules = [
         (("unsupported url",), "This kind of link isn't supported - open the post itself and save from there", False),
         (("private", "only available for registered", "this account is private"), "The post is private", False),
-        (("login required", "log in", "requires authentication", "use --cookies", "cookies"),
-         "The site wants a login to show this post (common on Instagram/Facebook) - we'll keep the screenshot", False),
+        (("checkpoint", "challenge_required"), "The saver account must confirm it's real on the site - an admin opens it "
+                                                "in Chrome, follows the steps, then presses Check in Settings", False),
+        (("login required", "log in", "requires authentication", "use --cookies", "cookies", "login_required"),
+         "The site wants a login to show this post - an admin connects the saver account (Studio → Settings → "
+         "Inspiration sources)", False),
         (("not available", "removed", "deleted", "does not exist", "404", "no video in that post", "no video formats"),
          "The post was deleted, isn't public, or has no video", False),
         (("larger than max-filesize", "file too big", "max-filesize"), "The video is over 120 MB", False),
@@ -375,6 +385,13 @@ def work_once() -> bool:
     if not a:
         q("update jobs set status='gone', updated=? where id=?", (time.time(), j["id"]))
         return True
+    acct = accounts.platform_for(j["url"]) if j["mode"] != "direct" else ""
+    if acct and accounts.usable(acct):           # the saver account is used gently: random gaps, an hourly cap
+        w = accounts.slot_wait(acct)
+        if w > 0:
+            q("update jobs set status='queued', tries=tries-1, next_at=?, updated=? where id=?", (time.time() + w, time.time(), j["id"]))
+            return True
+        accounts.slot_take(acct)
     _set(aid, "downloading")
     try:
         if j["mode"] == "direct":
@@ -407,6 +424,9 @@ def work_once() -> bool:
         q("update jobs set status='done', error='', updated=? where id=?", (time.time(), j["id"]))
     except Exception as e:  # noqa: BLE001
         reason, retry = explain(e)
+        low = str(e).lower()
+        if acct and accounts.usable(acct) and any(k in low for k in ("login", "checkpoint", "challenge", "cookies")):
+            accounts.mark(acct, "checkpoint" if ("checkpoint" in low or "challenge" in low) else "login_required", reason)
         tries = (j["tries"] or 0) + 1
         if retry and tries < MAX_TRIES:
             q("update jobs set status='queued', error=?, next_at=?, updated=? where id=?",
@@ -775,6 +795,7 @@ async def save(request: Request):
                     kind=kind, sha=sha, title=str(form.get("title") or "")[:200], brand=str(form.get("brand") or "")[:120],
                     ad_text=str(form.get("ad_text") or "")[:2000], tags=json.dumps(_clean_tags(str(form.get("tags") or ""))),
                     note=str(form.get("note") or "")[:600], foreplay_id=str(form.get("foreplay_id") or ""),
+                    extra=json.dumps({k: str(form.get(k))[:200] for k in ("sender", "sender_name") if form.get(k)}),
                     status="reading")            # no canon: a picture of a post must not block saving its real video later
     threading.Thread(target=ai_read, args=(aid,), daemon=True).start()
     threading.Thread(target=_scan, args=(pathlib.Path(path).parent,), daemon=True).start()
@@ -812,7 +833,7 @@ def _queue_save(form, by: str, c: dict | None, target: str, page: str, media_url
     shot = _shot(form, plat)
     if shot:
         extra["thumb"] = shot
-    for k in ("author", "post_id", "detected"):
+    for k in ("author", "post_id", "detected", "sender", "sender_name"):
         if form.get(k):
             extra[k] = str(form.get(k))[:200]
     aid = insert_ad(by=by, source=str(form.get("source") or "extension")[:20], platform=plat[:30],
@@ -879,6 +900,31 @@ async def thumb(request: Request):
     return FileResponse(t)
 
 
+# where a save came from (the `source` column) -> what the Studio shows: "via Instagram DM" etc.
+VIA = {"extension": ("extension%",), "instagram": ("instagram-dm",), "telegram": ("telegram", "phone"),
+       "android": ("android-share",), "studio": ("studio-link", "studio"), "foreplay": ("foreplay",)}
+SORTS = {"new": "ts desc", "old": "ts asc",
+         "views": "coalesce(json_extract(extra,'$.source.view_count'), -1) desc, ts desc",
+         "likes": "coalesce(json_extract(extra,'$.source.like_count'), -1) desc, ts desc",
+         "platform": "platform collate nocase, ts desc", "label": "(tags='[]' or tags=''), tags collate nocase, ts desc"}
+
+
+def via_of(source: str) -> str:
+    s = source or ""
+    for k, pats in VIA.items():
+        if any(s == p or (p.endswith("%") and s.startswith(p[:-1])) for p in pats):
+            return k
+    return "other"
+
+
+def _via_sql(v: str) -> tuple[str, list]:
+    pats = VIA.get(v)
+    if not pats:
+        known = [p for ps in VIA.values() for p in ps]
+        return "not (" + " or ".join("source like ?" for _ in known) + ")", known
+    return "(" + " or ".join("source like ?" for _ in pats) + ")", list(pats)
+
+
 @guard
 async def items(request: Request):
     qp = request.query_params
@@ -892,6 +938,13 @@ async def items(request: Request):
     if qp.get("by"):
         where.append("by=?")
         args.append(qp["by"])
+    if qp.get("via"):
+        w, a = _via_sql(qp["via"])
+        where.append(w)
+        args += a
+    if qp.get("sender"):
+        where.append("json_extract(extra,'$.sender')=?")
+        args.append(qp["sender"])
     if qp.get("status") == "working":
         where.append("status in ('queued','downloading','reading')")
     elif qp.get("status"):
@@ -911,7 +964,8 @@ async def items(request: Request):
         where.append("tags like ?")
         args.append('%"' + qp["tag"].replace('"', "") + '"%')
     lim, off = min(200, int(qp.get("limit", 60))), int(qp.get("offset", 0))
-    rows = q(f"select * from ads where {' and '.join(where)} order by ts desc limit ? offset ?", (*args, lim, off))
+    order = SORTS.get(qp.get("sort", "new"), SORTS["new"])
+    rows = q(f"select * from ads where {' and '.join(where)} order by {order} limit ? offset ?", (*args, lim, off))
     inf = {}
     if rows:
         ids = [r["id"] for r in rows]
@@ -922,8 +976,14 @@ async def items(request: Request):
         r["tags"] = json.loads(r["tags"] or "[]")
         r["extra"] = json.loads(r["extra"] or "{}")
         r["folders"] = inf.get(r["id"], [])
+        r["via"] = via_of(r["source"])
     plats = [r["platform"] for r in q("select distinct platform from ads order by platform")]
-    return JSONResponse({"items": rows, "platforms": plats, "total": q(f"select count(*) c from ads where {' and '.join(where)}",
+    facets = {"by": q("select by, count(*) n from ads where source<>'foreplay' group by by order by n desc limit 50"),
+              "via": [{"via": k, "n": sum(r["n"] for r in q("select source, count(*) n from ads group by source")
+                                           if via_of(r["source"]) == k)} for k in VIA],
+              "senders": q("select json_extract(extra,'$.sender') sender, by, count(*) n from ads where "
+                           "json_extract(extra,'$.sender') is not null group by 1, 2 order by n desc limit 50")}
+    return JSONResponse({"items": rows, "platforms": plats, "facets": facets, "total": q(f"select count(*) c from ads where {' and '.join(where)}",
                                                                         tuple(args), one=True)["c"],
                          "foreplay": {"connected": bool(fp_key()), "used": fp_used(), "cap": fp_cap()}})
 
@@ -1103,14 +1163,67 @@ async def bulk_tags(request: Request):
     return JSONResponse({"ok": True})
 
 
+# ---------- saver accounts + Instagram DM inbox (see accounts.py) ----------
+@guard
+async def accts(request: Request):
+    return JSONResponse({p: accounts.status(p) for p in accounts.PLATFORMS})
+
+
+@guard
+async def acct(request: Request):
+    import asyncio
+    p = request.path_params["platform"]
+    if p not in accounts.PLATFORMS:
+        return JSONResponse({"error": "unknown platform"}, status_code=404)
+    run = asyncio.get_running_loop().run_in_executor
+    if request.method == "DELETE":
+        accounts.disconnect(p, request.headers.get("x-user", ""))
+        return JSONResponse(accounts.status(p))
+    if request.path_params.get("op") == "check":
+        return JSONResponse(await run(None, accounts.check, p))
+    if request.path_params.get("op"):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    d = await request.json()
+    try:
+        accounts.connect(p, d.get("cookies") or [], request.headers.get("x-user", ""))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return JSONResponse(await run(None, accounts.check, p))
+
+
+@guard
+async def ig_inbox(request: Request):
+    import asyncio
+    try:
+        return JSONResponse(await asyncio.get_running_loop().run_in_executor(None, accounts.ig_inbox))
+    except (PermissionError, RuntimeError) as e:
+        return JSONResponse({"error": str(e), "items": [], "account": accounts.status("instagram")}, status_code=409)
+
+
+@guard
+async def ig_reply(request: Request):
+    import asyncio
+    d = await request.json()
+    try:
+        ok_ = await asyncio.get_running_loop().run_in_executor(None, accounts.ig_reply, str(d.get("thread_id") or ""),
+                                                               str(d.get("text") or ""), bool(d.get("pending")))
+        return JSONResponse({"ok": ok_})
+    except (PermissionError, RuntimeError) as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=409)
+
+
 async def health(request):
     return JSONResponse({"ok": True, "ads": q("select count(*) c from ads", one=True)["c"]})
 
 
+accounts.init(q)
 app = Starlette(routes=[Route("/health", health), Route("/v1/save", save, methods=["POST"]), Route("/v1/items", items),
                         Route("/v1/items/{aid}", item, methods=["GET", "PATCH", "DELETE"]), Route("/v1/media/{aid}", media),
                         Route("/v1/thumb/{aid}", thumb), Route("/v1/status", status),
                         Route("/v1/retry/{aid}", retry_ep, methods=["POST"]),
+                        Route("/v1/accounts", accts), Route("/v1/accounts/{platform}", acct, methods=["POST", "DELETE"]),
+                        Route("/v1/accounts/{platform}/{op}", acct, methods=["POST"]),
+                        Route("/v1/inbox/instagram", ig_inbox), Route("/v1/inbox/instagram/reply", ig_reply, methods=["POST"]),
                         Route("/v1/foreplay/search", foreplay),
                         Route("/v1/folders", folders, methods=["GET", "POST"]),
                         Route("/v1/folders/{fid}", folder, methods=["PATCH", "DELETE"]),

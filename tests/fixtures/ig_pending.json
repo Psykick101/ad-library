@@ -1,0 +1,6 @@
+{"viewer": {"pk": "61000000001", "username": "psykick.saver"},
+ "inbox": {"threads": [
+  {"thread_id": "340282366841710300949128100000000003", "pending": true,
+   "users": [{"pk": "7700001", "username": "stranger.x", "full_name": "Stranger"}],
+   "items": [{"item_id": "3100000000000000000000000000020", "user_id": 7700001, "timestamp": 1761550200000000, "item_type": "clip",
+              "clip": {"clip": {"code": "DBstrange6", "product_type": "clips"}}}]}]}}

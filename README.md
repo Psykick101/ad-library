@@ -8,6 +8,7 @@ Part of the Psykick / home-lab microservices split (2026-10-25). Each service ha
 
 - `.gitignore`
 - `README.md`
+- `accounts.py`
 - `extension/background.js`
 - `extension/config.js`
 - `extension/connect.js`
@@ -35,6 +36,11 @@ Part of the Psykick / home-lab microservices split (2026-10-25). Each service ha
 - `tests/ext/fixtures/youtube_shorts.html`
 - `tests/ext/test_e2e.py`
 - `tests/ext/test_finder.py`
+- `tests/fixtures/fb_home_ok.html`
+- `tests/fixtures/fb_login.html`
+- `tests/fixtures/ig_inbox.json`
+- `tests/fixtures/ig_pending.json`
+- `tests/test_accounts.py`
 
 ## Deploy
 

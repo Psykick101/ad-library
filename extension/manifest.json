@@ -1,12 +1,13 @@
 {
  "manifest_version": 3,
  "name": "Save to Psykick Studio",
- "version": "1.3.0",
+ "version": "1.4.0",
  "description": "Save ads you find anywhere to the Psykick Creative Studio library. Videos are found by their post link and downloaded for real, with their source (author, caption, stats).",
  "permissions": [
   "activeTab",
   "alarms",
   "contextMenus",
+  "cookies",
   "notifications",
   "scripting",
   "storage"

@@ -20,6 +20,8 @@ h4{margin:6px 0 0;font-size:12px;color:var(--mut);font-weight:600;text-transform
 .pill.queued,.pill.downloading,.pill.reading{color:var(--blue);background:#17263a}.pill.done{color:var(--acc);background:#13201b}
 .pill.failed,.pill.gone{color:var(--bad);background:#2a1616}.err{color:var(--bad)}
 .f{border-top:1px solid var(--line);padding:8px 14px;font-size:12px;color:var(--mut);display:flex;flex-direction:column;gap:6px}
+details{border:1px solid var(--line);border-radius:10px;padding:8px 10px}details summary{cursor:pointer;color:var(--mut);font-size:12px;font-weight:600}
+details[open]{display:flex;flex-direction:column;gap:8px}#sv-st.okk{color:var(--acc)}#sv-st.bad{color:var(--bad)}
 .f b{color:var(--fg)}.f button{padding:7px;font-size:13px}
 </style></head><body>
 <div class="h"><i></i>Save to Psykick Studio<span class="who" id="who"></span></div>
@@ -33,6 +35,12 @@ h4{margin:6px 0 0;font-size:12px;color:var(--mut);font-weight:600;text-transform
   <p class="m">Videos are found by their post link and downloaded for real, with author, caption and stats. Right-click any video → <b>Save this video</b>. Shortcut: <b>Alt+Shift+S</b>.</p>
   <h4 id="rech" hidden>Your recent saves</h4><div id="rec"></div>
   <a id="lib" href="#" target="_blank">Open Inspiration</a>
+  <details id="adm" hidden><summary>Saver accounts (admins)</summary>
+    <p class="m">Use a separate Chrome profile that's logged in to the <b>company's</b> saver account - never your personal one.
+    Press the button, then just close that window: <b>don't log out</b> (that ends the session).</p>
+    <button class="s" id="sv-ig">Connect this Instagram login as the saver account</button>
+    <button class="s" id="sv-fb">Connect this Facebook login as the saver account</button>
+    <p class="m" id="sv-st"></p></details>
 </div>
 <div class="f" id="upd"></div>
 <script src="popup.js"></script></body></html>

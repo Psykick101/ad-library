@@ -51,7 +51,7 @@ async function storeToken(m) {
   if (!m || typeof m.token !== "string" || !m.token.startsWith("psx_")) return {ok: false};
   const r = await api("/api/ext/ping", {}, m.token);
   if (!r.ok || !r.data.user) return {ok: false, error: r.error || "token refused"};
-  await chrome.storage.local.set({auth: {token: m.token, email: r.data.user, id: m.id || "", at: Date.now()}});
+  await chrome.storage.local.set({auth: {token: m.token, email: r.data.user, role: r.data.role || "", id: m.id || "", at: Date.now()}});
   notify("Connected ✓", `Saving as ${r.data.user}. Right-click any ad, or press Alt+Shift+S.`);
   return {ok: true, email: r.data.user};
 }
@@ -80,6 +80,28 @@ async function api(path, opts = {}, token) {
     return {ok: false, status: 401, connect: true, data, error: "Not connected - press Connect in the extension."};
   }
   return {ok: r.ok, status: r.status, data, error: r.ok ? "" : (data.error || `Error ${r.status}`)};
+}
+
+// ---------------- admins: "Connect as saver account" (the company's Instagram / Facebook account) ----------------
+// Reads ONLY these cookies of the account logged in in this Chrome profile and sends them once to the Studio, which
+// keeps them encrypted in the Ad Library (downloads + Instagram DMs run as that account). Nothing else is read.
+const SAVER = {instagram: {url: "https://www.instagram.com/", names: ["sessionid", "ds_user_id", "csrftoken"], label: "Instagram"},
+               facebook: {url: "https://www.facebook.com/", names: ["c_user", "xs", "datr"], label: "Facebook"}};
+async function connectSaver(platform) {
+  const s = SAVER[platform];
+  const a = await getAuth();
+  if (!s || !a) return {ok: false, error: "Connect the extension first."};
+  if (!["owner", "admin"].includes(a.role)) return {ok: false, error: "Only admins can connect the saver account."};
+  let all = [];
+  try { all = await chrome.cookies.getAll({url: s.url}); } catch (e) { return {ok: false, error: "Chrome didn't allow reading the login."}; }
+  const cookies = all.filter(c => s.names.includes(c.name))
+    .map(c => ({name: c.name, value: c.value, domain: c.domain, expirationDate: c.expirationDate || 0}));
+  const missing = s.names.filter(n => !cookies.some(c => c.name === n));
+  if (missing.length) return {ok: false, error: `Log in to the ${s.label} saver account in this Chrome profile first (not signed in here).`};
+  const r = await api("/api/ext/saver-account", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({platform, cookies})});
+  if (!r.ok) return {ok: false, error: r.error};
+  const st = r.data;
+  return {ok: st.status === "ok", status: st, error: st.status === "ok" ? "" : (st.error || st.status)};
 }
 
 // ---------------- feedback: notification + a small toast in the page ----------------
@@ -331,11 +353,17 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
     // everything below: the extension's own pages (the popup) only - never a web page's content script
     const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
     if (m.do === "state") {
-      const {auth, recent = [], latest} = await chrome.storage.local.get(["auth", "recent", "latest"]);
+      let {auth, recent = [], latest} = await chrome.storage.local.get(["auth", "recent", "latest"]);
+      if (auth && auth.role === undefined) {               // connected before 1.4: learn the role once
+        const p = await api("/api/ext/ping");
+        if (p.ok && p.data.user) { auth = {...auth, role: p.data.role || ""}; await chrome.storage.local.set({auth}); }
+      }
       const c = tab ? F.canonical(tab.url || "") : null;
-      return reply({email: auth && auth.email, recent, latest, version: VERSION, post: c ? {url: c.url, platform: c.platform} : null, studio: STUDIO});
+      return reply({email: auth && auth.email, role: auth && auth.role, recent, latest, version: VERSION,
+                    post: c ? {url: c.url, platform: c.platform} : null, studio: STUDIO});
     }
     if (m.do === "connect") { await openConnect(); return reply({ok: true}); }
+    if (m.do === "saver") return reply(await connectSaver(m.platform));
     if (m.do === "disconnect") { await api("/api/ext/disconnect", {method: "POST"}); await chrome.storage.local.remove("auth"); return reply({ok: true}); }
     if (m.do === "poll") return reply({recent: await poll()});
     if (m.do === "retry") { const r = await api("/api/ext/retry/" + encodeURIComponent(m.id), {method: "POST"});
@@ -353,4 +381,4 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
 });
 
 // for the tests (and the console): self.PS.selectArea(tab) etc.
-self.PS = {selectArea, savePageVideo, saveScreen, decideAndSave, save, poll, storeToken, openConnect, api};
+self.PS = {selectArea, savePageVideo, saveScreen, decideAndSave, save, poll, storeToken, openConnect, api, connectSaver};
