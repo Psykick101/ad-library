@@ -26,6 +26,7 @@ import os
 import pathlib
 import re
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -345,6 +346,36 @@ def _set(aid: str, status: str, **extra) -> None:
     q("update ads set status=?, extra=? where id=?", (status, json.dumps(ex), aid))
 
 
+def _faststart(video_path: str) -> None:
+    """Move the mp4 index to the front so the Studio can start playing before the whole file has loaded."""
+    import subprocess
+    src = pathlib.Path(video_path)
+    if src.suffix.lower() not in (".mp4", ".m4v", ".mov"):
+        return
+    tmp = src.with_name(src.stem + ".fs" + src.suffix)
+    try:
+        subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-i", str(src), "-c", "copy", "-movflags", "+faststart", str(tmp)],
+                       timeout=120, check=True, capture_output=True)
+        if tmp.exists() and tmp.stat().st_size > 0:
+            tmp.replace(src)
+    except Exception:  # noqa: BLE001
+        tmp.unlink(missing_ok=True)
+
+
+def video_prep(aid: str) -> None:
+    """Faststart + thumbnail for a saved video (background; used by downloads, Foreplay imports and the backfill)."""
+    a = q("select media, kind, extra from ads where id=?", (aid,), one=True)
+    if not a or a["kind"] != "video" or not a["media"]:
+        return
+    _faststart(a["media"])
+    th = _thumb(a["media"])
+    if th:
+        ex = json.loads(a["extra"] or "{}")
+        if ex.get("thumb") != th:
+            ex["thumb"] = th
+            q("update ads set extra=? where id=?", (json.dumps(ex), aid))
+
+
 def _thumb(video_path: str) -> str:
     """First-second frame of a video as a jpg next to it ("" if ffmpeg isn't there)."""
     import subprocess
@@ -409,6 +440,8 @@ def work_once() -> bool:
             q("update jobs set status='done', error=?, updated=? where id=?", ("duplicate of " + dup["id"], time.time(), j["id"]))
             return True
         ex = json.loads(a.get("extra") or "{}")
+        if kind == "video":
+            _faststart(path)
         th = _thumb(path) if kind == "video" else ""
         ex.update({"source": facts, **({"thumb": th} if th else {}), "fetched_from": j["mode"]})
         desc = str(facts.get("description") or facts.get("title") or "")
@@ -471,6 +504,40 @@ READ = ("This is an ad saved as inspiration by a performance-marketing team. JSO
         "\"vertical\": \"ecommerce | igaming | leadgen | apps | other\", \"why_it_works\": \"one short sentence\"}")
 
 
+def _json_obj(text: str) -> str:
+    """The model's JSON object as text; repairs an answer cut off by the token limit (closes strings/brackets)."""
+    i = text.find("{")
+    if i < 0:
+        return "{}"
+    t = text[i:]
+    for end in range(len(t), 0, -1):          # longest prefix that parses (usually the whole thing)
+        if t[end - 1] != "}":
+            continue
+        try:
+            json.loads(t[:end])
+            return t[:end]
+        except ValueError:
+            continue
+    fix, depth, q_, esc = t, [], False, False      # cut off mid-way: close what's open
+    for ch in t:
+        if esc:
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == '"':
+            q_ = not q_
+        elif not q_ and ch in "{[":
+            depth.append("}" if ch == "{" else "]")
+        elif not q_ and ch in "}]" and depth:
+            depth.pop()
+    fix = t + ('"' if q_ else "") + "".join(reversed(depth))
+    try:
+        json.loads(fix)
+        return fix
+    except ValueError:
+        return "{}"
+
+
 def ai_read(aid: str) -> None:
     a = q("select * from ads where id=?", (aid,), one=True)
     if not a or not a["media"]:
@@ -489,12 +556,12 @@ def ai_read(aid: str) -> None:
         buf = io.BytesIO()
         im.save(buf, "JPEG", quality=85)
         ctx = " ".join(x for x in (a["title"], a["brand"], a["ad_text"]) if x)[:600]
-        body = {"model": "claude-haiku", "temperature": 0, "max_tokens": 400, "messages": [{"role": "user", "content": [
+        body = {"model": "claude-haiku", "temperature": 0, "max_tokens": 1200, "messages": [{"role": "user", "content": [
             {"type": "text", "text": READ + (f"\nKnown details: {ctx}" if ctx else "")},
             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()}}]}]}
         r = httpx.post(LLM_URL, headers={"Authorization": f"Bearer {LLM_KEY.read_text().strip()}"}, json=body, timeout=90)
-        m = re.search(r"\{.*\}", r.json()["choices"][0]["message"]["content"] or "", re.S)
-        q("update ads set ai=? where id=?", (m.group(0) if m else "{}", aid))
+        out = r.json()["choices"][0]["message"]["content"] or ""
+        q("update ads set ai=? where id=?", (_json_obj(out), aid))
     except Exception as e:  # noqa: BLE001
         q("update ads set ai=? where id=?", (json.dumps({"summary": f"(couldn't read: {str(e)[:80]})"}), aid))
     finally:
@@ -667,7 +734,7 @@ def fp_import(ad: dict, by: str, tags: list | None = None, note: str = "") -> di
                     title=str(ad.get("headline") or "")[:200], brand=str(ad.get("brand") or "")[:120],
                     ad_text=str(ad.get("text") or "")[:2000], tags=json.dumps([t[:30] for t in (tags or [])][:12]),
                     note=note[:600], foreplay_id=fid, extra=json.dumps(extra), status="done")
-    threading.Thread(target=ai_read, args=(aid,), daemon=True).start()
+    threading.Thread(target=lambda: (video_prep(aid), ai_read(aid)), daemon=True).start()
     threading.Thread(target=_scan, args=(pathlib.Path(path).parent,), daemon=True).start()
     return {"id": aid}
 
@@ -1230,6 +1297,21 @@ app = Starlette(routes=[Route("/health", health), Route("/v1/save", save, method
                         Route("/v1/folders/{fid}/items", folder_items, methods=["POST"]),
                         Route("/v1/tags", bulk_tags, methods=["POST"]),
                         Route("/v1/foreplay/{what}", foreplay_call, methods=["GET", "POST"])])
+
+def backfill() -> dict:
+    """One-off: thumbnails + faststart for every saved video, and a fresh AI read where the old one came back empty."""
+    vids = [r["id"] for r in q("select id from ads where kind='video' and media<>''")]
+    for aid in vids:
+        video_prep(aid)
+    empty = [r["id"] for r in q("select id from ads where media<>'' and (ai is null or ai in ('', '{}'))")]
+    for aid in empty:
+        ai_read(aid)
+    return {"videos": len(vids), "re_read": len(empty)}
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "backfill":
+    print(backfill())
+    sys.exit(0)
 
 if __name__ == "__main__":
     import sys
