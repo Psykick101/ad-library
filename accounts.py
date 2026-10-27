@@ -28,8 +28,19 @@ import httpx
 VAULT = pathlib.Path(os.getenv("LIBRARY_VAULT", "/var/lib/ad-library/accounts"))
 VAULT_KEY = pathlib.Path(os.getenv("LIBRARY_VAULT_KEY", "/etc/ai-secrets/ad-library-vault.key"))
 PLATFORMS = ("instagram", "facebook")
-NEEDED = {"instagram": ("sessionid", "ds_user_id", "csrftoken"), "facebook": ("c_user", "xs", "datr")}
-DOMAIN = {"instagram": "instagram.com", "facebook": "facebook.com"}
+# MULTI-CONNECT: Instagram has a MAIN slot ("instagram") and a BACKUP slot ("instagram_backup"). Everything works as
+# one account as before; the backup is only used while the main one isn't usable (see active_ig), and the main takes
+# over again by itself as soon as its health check is ok.
+IG_SLOTS = ("instagram", "instagram_backup")
+SLOTS = PLATFORMS + ("instagram_backup",)
+NEEDED = {"instagram": ("sessionid", "ds_user_id", "csrftoken"), "facebook": ("c_user", "xs", "datr"),
+          "instagram_backup": ("sessionid", "ds_user_id", "csrftoken")}
+DOMAIN = {"instagram": "instagram.com", "facebook": "facebook.com", "instagram_backup": "instagram.com"}
+
+
+def base(platform: str) -> str:
+    """instagram_backup -> instagram (the site it logs in to)."""
+    return "instagram" if platform in IG_SLOTS else platform
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 IG_APP_ID = "936619743392459"                  # instagram.com's own web app id (public, sent by every browser)
 GAP = (int(os.getenv("ACCOUNT_GAP_MIN", "25")), int(os.getenv("ACCOUNT_GAP_MAX", "60")))
@@ -88,7 +99,7 @@ def _set_meta(platform: str, **kv) -> dict:
 
 def connect(platform: str, cookies: list, by: str) -> dict:
     """Admin sent the saver account's cookies (from the extension). Keeps only the needed ones, encrypted."""
-    if platform not in PLATFORMS:
+    if platform not in SLOTS:
         raise ValueError("unknown platform")
     keep = {}
     for c in cookies or []:
@@ -103,10 +114,15 @@ def connect(platform: str, cookies: list, by: str) -> dict:
     missing = [n for n in NEEDED[platform] if n not in keep]
     if missing:
         raise ValueError(f"missing {', '.join(missing)} - log in to the saver account in this Chrome profile first")
+    uid = keep["ds_user_id" if base(platform) == "instagram" else "c_user"]["value"]
+    if platform in IG_SLOTS:                       # main and backup must be two different accounts
+        other = IG_SLOTS[1 - IG_SLOTS.index(platform)]
+        if status(other)["connected"] and status(other)["user_id"] == uid:
+            raise ValueError("this is the same Instagram account that is already connected as the "
+                             + ("backup" if platform == "instagram" else "main") + " saver account - log in to a different one")
     _store(platform, list(keep.values()))
-    sess = keep["sessionid" if platform == "instagram" else "xs"]["expires"]      # the session cookie decides
+    sess = keep["sessionid" if base(platform) == "instagram" else "xs"]["expires"]      # the session cookie decides
     exp = [sess] if sess else [c["expires"] for c in keep.values() if c["expires"]]
-    uid = keep["ds_user_id" if platform == "instagram" else "c_user"]["value"]
     _set_meta(platform, connected=True, by=by, connected_at=time.time(), user_id=uid, expires=min(exp) if exp else 0,
               status="unchecked", error="", handle="", checked=0)
     return status(platform)
@@ -232,7 +248,7 @@ def classify(platform: str, code: int, location: str, body: str) -> tuple[str, s
         return "rate_limited", "the site is slowing the account down - it rests for a while"
     if "/accounts/login" in loc or "/login" in loc or '"login_required"' in low or "login_required" in low or code in (401,):
         return "login_required", "the session ended (logged out or expired) - reconnect the saver account"
-    if platform == "instagram" and code == 200:
+    if base(platform) == "instagram" and code == 200:
         try:
             u = (json.loads(b).get("user") or {})
             if u.get("username"):
@@ -256,7 +272,7 @@ def _client(platform: str, cookies: list) -> httpx.Client:
     for c in cookies:
         jar.set(c["name"], c["value"], domain=c["domain"], path="/")
     h = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
-    if platform == "instagram":
+    if base(platform) == "instagram":
         csrf = next((c["value"] for c in cookies if c["name"] == "csrftoken"), "")
         h.update({"X-IG-App-ID": IG_APP_ID, "X-CSRFToken": csrf, "X-Requested-With": "XMLHttpRequest",
                   "Referer": "https://www.instagram.com/direct/inbox/", "Origin": "https://www.instagram.com"})
@@ -267,7 +283,7 @@ def check(platform: str) -> dict:
     cookies = load(platform)
     if not cookies:
         return status(platform)
-    url = ("https://www.instagram.com/api/v1/accounts/current_user/?edit=true" if platform == "instagram"
+    url = ("https://www.instagram.com/api/v1/accounts/current_user/?edit=true" if base(platform) == "instagram"
            else "https://www.facebook.com/settings/?tab=account")
     try:
         with _client(platform, cookies) as c:
@@ -348,17 +364,17 @@ def ig_parse(inbox: dict, pending: bool = False) -> tuple[dict, list]:
 IG_RETRY_WAIT = 3.0                                # tests set 0
 
 
-def _ig_call(method: str, path: str, **kw) -> dict:
+def _ig_call(method: str, path: str, slot: str = "instagram", **kw) -> dict:
     """One call to instagram.com as the saver account. Network blips / Instagram 5xx are tried once more after a short
     pause (only GETs: a repeated POST could send a reply twice). Always raises RuntimeError / PermissionError with a
     plain-English reason, never a raw httpx error."""
-    cookies = load("instagram")
+    cookies = load(slot)
     if not cookies:
         raise PermissionError("the Instagram saver account isn't connected")
     tries = 2 if method == "GET" else 1
     for k in range(tries):
         try:
-            with _client("instagram", cookies) as c:
+            with _client(slot, cookies) as c:
                 r = c.request(method, IG + path, **kw)
         except httpx.HTTPError as e:
             if k + 1 < tries:
@@ -372,7 +388,7 @@ def _ig_call(method: str, path: str, **kw) -> dict:
     if r.status_code != 200 or r.headers.get("location"):
         state, detail = classify("instagram", r.status_code, r.headers.get("location", ""), r.text)
         if state not in ("ok", "error"):           # login wall / checkpoint / rate limit -> the account rests
-            mark("instagram", state, detail)
+            mark(slot, state, detail)
         raise RuntimeError(detail if state != "error" else f"Instagram answered {r.status_code}")
     try:
         return r.json()
@@ -380,19 +396,53 @@ def _ig_call(method: str, path: str, **kw) -> dict:
         raise RuntimeError("unexpected answer from Instagram")  # noqa: B904
 
 
+def active_ig() -> str:
+    """Which Instagram saver account is doing the work right now: the main one while it is usable, else the backup,
+    else "" (none). The main takes over again automatically once its status is ok / unchecked."""
+    for sl in IG_SLOTS:
+        if usable(sl):
+            return sl
+    return ""
+
+
+def active(platform: str) -> str:
+    """The account slot to use for a download of this platform ("instagram" -> main or backup)."""
+    if platform == "instagram":
+        return active_ig() or "instagram"
+    return platform
+
+
+_last_slot = {"slot": "instagram"}                 # the account the last inbox read came from: replies go out as it
+
+
 def ig_inbox(limit: int = 20) -> dict:
-    """The saver account's DMs (main inbox + message requests) -> {"viewer", "items", "warnings"} or {"busy": seconds}.
-    The main inbox must work; a failing message-request list only adds a warning (its DMs are read on the next pass)."""
-    if not usable("instagram"):
+    """The saver account's DMs (main inbox + message requests) -> {"viewer", "items", "warnings", "slot"} or {"busy": s}.
+    The main inbox must work; a failing message-request list only adds a warning (its DMs are read on the next pass).
+    If the main account fails during the read, the backup (if connected and usable) is tried in the same pass."""
+    cands = [sl for sl in IG_SLOTS if usable(sl)]
+    if not cands:
         return {"error": "the Instagram saver account isn't connected or needs attention", "items": []}
-    w = slot_wait("instagram")
-    if w > 0:
-        return {"busy": round(w), "items": []}
-    slot_take("instagram")
+    last_err = None
+    for sl in cands:
+        w = slot_wait(sl)
+        if w > 0:                                  # resting between uses is not a failure: never switch account for it
+            return {"busy": round(w), "items": []}
+        try:
+            out = _ig_inbox_one(sl, limit)
+        except (RuntimeError, PermissionError) as e:
+            last_err = e
+            continue
+        _last_slot["slot"] = sl
+        return out
+    raise last_err
+
+
+def _ig_inbox_one(slot: str, limit: int) -> dict:
+    slot_take(slot)
     items, viewer, warnings = [], {}, []
     for path, pend in (("/api/v1/direct_v2/inbox/", False), ("/api/v1/direct_v2/pending_inbox/", True)):
         try:
-            j = _ig_call("GET", path, params={"persistentBadging": "true", "limit": str(limit), "thread_message_limit": "10"})
+            j = _ig_call("GET", path, slot, params={"persistentBadging": "true", "limit": str(limit), "thread_message_limit": "10"})
         except RuntimeError as e:
             if not pend:
                 raise
@@ -402,16 +452,17 @@ def ig_inbox(limit: int = 20) -> dict:
         viewer = viewer or v
         items += its
     if viewer.get("username"):
-        _set_meta("instagram", handle=viewer["username"])
-    return {"viewer": viewer, "items": sorted(items, key=lambda x: x["ts"]), "warnings": warnings}
+        _set_meta(slot, handle=viewer["username"])
+    return {"viewer": viewer, "items": sorted(items, key=lambda x: x["ts"]), "warnings": warnings, "slot": slot}
 
 
-def ig_reply(thread_id: str, text: str, pending: bool = False) -> bool:
+def ig_reply(thread_id: str, text: str, pending: bool = False, slot: str = "") -> bool:
     if not re.fullmatch(r"\d{5,40}", thread_id or ""):
         return False
+    slot = slot if slot in IG_SLOTS else _last_slot["slot"]      # a conversation belongs to the account that read it
     if pending:                                    # a message request: accept it first, or the reply can't be sent
-        _ig_call("POST", f"/api/v1/direct_v2/threads/{thread_id}/approve/")
-    _ig_call("POST", "/api/v1/direct_v2/threads/broadcast/text/",
+        _ig_call("POST", f"/api/v1/direct_v2/threads/{thread_id}/approve/", slot)
+    _ig_call("POST", "/api/v1/direct_v2/threads/broadcast/text/", slot,
              data={"thread_ids": f"[{thread_id}]", "text": text[:500], "client_context": str(uuid.uuid4().int)[:19],
                    "action": "send_item"})
     return True

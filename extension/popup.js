@@ -35,7 +35,8 @@ async function refresh() {
   $("lib").href = (ST.studio || "https://studio.psykick.cc") + "/studio#inspiration";
   renderRecent(ST.recent);
   foot(ST.latest);
-  $("adm").hidden = !(on && ["owner", "admin"].includes(ST.role));
+  $("adm").hidden = !on;                                   // Instagram saver account: everyone (the Studio wizard explains it)
+  $("sv-fb").hidden = !["owner", "admin"].includes(ST.role);   // Facebook: admins only
 }
 
 // version + update (footer)
@@ -61,10 +62,10 @@ refresh();
 send({do: "poll"}).then(r => r.recent && renderRecent(r.recent));
 setInterval(async () => { const r = await send({do: "poll"}); if (r.recent) renderRecent(r.recent); }, 3000);
 
-for (const [id, platform] of [["sv-ig", "instagram"], ["sv-fb", "facebook"]]) {
+for (const [id, platform, slot] of [["sv-ig", "instagram", "main"], ["sv-ig2", "instagram", "backup"], ["sv-fb", "facebook", "main"]]) {
   $(id).onclick = async () => {
     const st = $("sv-st"); st.className = "m"; st.textContent = "Connecting…";
-    const r = await send({do: "saver", platform});
+    const r = await send({do: "saver", platform, slot});
     st.className = "m " + (r.ok ? "okk" : "bad");
     st.textContent = r.ok ? `Connected ✓ as ${r.status.handle ? "@" + r.status.handle : "the saver account"} - check OK.` : (r.error || "Couldn't connect.");
   };

@@ -59,6 +59,11 @@ STATE = {"ig": "ok", "fb": "ok"}
 def site(req: httpx.Request):
     SEEN.append((req.method, str(req.url), req.headers.get("cookie", ""), req.content.decode() if req.content else ""))
     u = str(req.url)
+    bk = "BACKUPSESS" in req.headers.get("cookie", "")
+    if "instagram.com/api/v1/accounts/current_user" in u and bk:
+        return httpx.Response(200, json={"user": {"username": "backup.saver", "pk": "61000000002"}, "status": "ok"})
+    if "direct_v2/" in u and STATE.get("main_login") and not bk:
+        return httpx.Response(302, headers={"location": "https://www.instagram.com/accounts/login/?next=/direct/"})
     if "instagram.com/api/v1/accounts/current_user" in u:
         if STATE["ig"] == "login":
             return httpx.Response(302, headers={"location": "https://www.instagram.com/accounts/login/?next=/api/v1/"})
@@ -249,6 +254,58 @@ with contextlib.redirect_stdout(OUT), contextlib.redirect_stderr(OUT):
     case("unexpected bug -> JSON error the Studio can show", r.status_code == 500 and "inbox read failed" in r.json()["error"])
     A.ig_inbox = orig
 
+    # ---- MULTI-CONNECT: a backup Instagram account takes over while the main one fails
+    BK_SECRET = "BACKUPSESS%3Azz9%3A27%3AAYdQ"
+    BK_COOKIES = [{"name": "sessionid", "value": BK_SECRET, "domain": ".instagram.com", "expirationDate": 1830000000},
+                  {"name": "ds_user_id", "value": "61000000002", "domain": ".instagram.com"},
+                  {"name": "csrftoken", "value": "bkCsrf987", "domain": ".instagram.com"}]
+    A.mark("instagram", "ok", "")
+    same = c.post("/v1/accounts/instagram_backup", headers=H, json={"cookies": IG_COOKIES})
+    case("backup: the same account as main is refused", same.status_code == 400 and "same Instagram account" in same.json()["error"], same.text[:120])
+    case("backup: nothing stored after a refusal", not A.status("instagram_backup")["connected"])
+    r = c.post("/v1/accounts/instagram_backup", headers=H, json={"cookies": BK_COOKIES})
+    st = r.json()
+    case("backup: connected + checked as its own handle", r.status_code == 200 and st["connected"] and st["status"] == "ok"
+         and st["handle"] == "backup.saver" and st["platform"] == "instagram_backup", st)
+    bf = T / "vault" / "instagram_backup.enc"
+    case("backup: vault file encrypted, mode 600", bf.exists() and BK_SECRET.encode() not in bf.read_bytes() and stat.S_IMODE(bf.stat().st_mode) == 0o600)
+    case("main untouched by the backup connect", A.status("instagram")["handle"] == "psykick.saver")
+    case("both slots listed", {"instagram", "facebook", "instagram_backup"} <= set(c.get("/v1/accounts", headers=H).json()))
+    case("main usable -> main is active, downloads use main", A.active_ig() == "instagram" and A.active("instagram") == "instagram"
+         and A.active("facebook") == "facebook")
+    A._uses.clear()
+    ib = c.get("/v1/inbox/instagram", headers=H).json()
+    case("healthy main: inbox read as main", ib.get("slot") == "instagram" and len(ib["items"]) == 10, ib.get("error"))
+    STATE["main_login"] = True
+    A._uses.clear()
+    SEEN.clear()
+    ib = c.get("/v1/inbox/instagram", headers=H).json()
+    case("main logged out mid-read -> same pass read as the backup", ib.get("slot") == "backup.saver" or ib.get("slot") == "instagram_backup", ib.get("error"))
+    case("main marked logged out, backup now active", A.status("instagram")["status"] == "login_required" and A.active_ig() == "instagram_backup")
+    case("downloads switch to the backup's cookies", A.active("instagram") == "instagram_backup")
+    with A.cookie_file(A.active("instagram")) as ckf:
+        txt = pathlib.Path(ckf).read_text()
+    case("backup cookie file has the backup session, not main's", BK_SECRET in txt and SECRET_IG not in txt)
+    SEEN.clear()
+    A.ig_reply("340282366841710300949128100000000003", "Saved", False)
+    case("reply goes out as the account that read the DMs (backup)", "BACKUPSESS" in SEEN[-1][2], SEEN[-1][2][:60])
+    A._uses.clear()
+    ib = c.get("/v1/inbox/instagram", headers=H).json()
+    case("while main is down the backup keeps reading", ib.get("slot") == "instagram_backup" and len(ib["items"]) == 10)
+    STATE.pop("main_login")
+    st = c.post("/v1/accounts/instagram/check", headers=H).json()
+    case("main checks ok again -> main takes over by itself", st["status"] == "ok" and A.active_ig() == "instagram")
+    A.mark("instagram", "login_required", "x")
+    A.mark("instagram_backup", "checkpoint", "x")
+    A._uses.clear()
+    case("both down -> clear error, nothing active", A.active_ig() == "" and "error" in c.get("/v1/inbox/instagram", headers=H).json())
+    A.mark("instagram", "ok", "")
+    A.mark("instagram_backup", "ok", "")
+    r = c.delete("/v1/accounts/instagram_backup", headers=H).json()
+    case("disconnecting the backup wipes it, main keeps working", not r["connected"] and not bf.exists() and A.active_ig() == "instagram")
+    case("facebook cannot be a backup slot", c.post("/v1/accounts/facebook_backup", headers=H, json={}).status_code == 404)
+    BK_SECRET_ALL = BK_SECRET
+
     # ---- disconnect wipes
     r = c.delete("/v1/accounts/facebook", headers=H).json()
     case("disconnect wipes the encrypted file", not r["connected"] and not (T / "vault" / "facebook.enc").exists() and A.load("facebook") is None)
@@ -257,7 +314,7 @@ with contextlib.redirect_stdout(OUT), contextlib.redirect_stderr(OUT):
     shown = json.dumps(c.get("/v1/accounts", headers=H).json()) + json.dumps(L.q("select * from accounts")) + \
         json.dumps(L.q("select * from state")) if L.q("select name from sqlite_master where name='state'") else ""
     shown += json.dumps(c.get("/v1/accounts", headers=H).json()) + json.dumps(L.q("select * from accounts"))
-    case("no cookie value in any status / DB row", not any(s in shown for s in (SECRET_IG, SECRET_IG2, SECRET_FB, "csrfTOKENabc123")))
+    case("no cookie value in any status / DB row", not any(s in shown for s in (SECRET_IG, SECRET_IG2, SECRET_FB, "csrfTOKENabc123", "BACKUPSESS%3Azz9", "bkCsrf987")))
 
     # ---- Inspiration filters + sorts
     L.q("delete from ads")
@@ -286,6 +343,6 @@ with contextlib.redirect_stdout(OUT), contextlib.redirect_stderr(OUT):
     case("DM save keeps who sent it", json.loads(L.q("select extra from ads where id=?", (s["id"],), one=True)["extra"])["sender"] == "@dana.creates")
 
 logged = OUT.getvalue()
-case("nothing printed or logged contains a cookie value", not any(s in logged for s in (SECRET_IG, SECRET_IG2, SECRET_FB, "csrfTOKENabc123")))
+case("nothing printed or logged contains a cookie value", not any(s in logged for s in (SECRET_IG, SECRET_IG2, SECRET_FB, "csrfTOKENabc123", "BACKUPSESS%3Azz9", "bkCsrf987")))
 print(f"{ok}/{n} OK")
 sys.exit(0 if ok == n else 1)

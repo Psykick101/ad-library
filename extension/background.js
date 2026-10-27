@@ -82,23 +82,24 @@ async function api(path, opts = {}, token) {
   return {ok: r.ok, status: r.status, data, error: r.ok ? "" : (data.error || `Error ${r.status}`)};
 }
 
-// ---------------- admins: "Connect as saver account" (the company's Instagram / Facebook account) ----------------
+// ---------------- "Connect as saver account" (the company's Instagram / Facebook account) ----------------
 // Reads ONLY these cookies of the account logged in in this Chrome profile and sends them once to the Studio, which
 // keeps them encrypted in the Ad Library (downloads + Instagram DMs run as that account). Nothing else is read.
 const SAVER = {instagram: {url: "https://www.instagram.com/", names: ["sessionid", "ds_user_id", "csrftoken"], label: "Instagram"},
                facebook: {url: "https://www.facebook.com/", names: ["c_user", "xs", "datr"], label: "Facebook"}};
-async function connectSaver(platform) {
+async function connectSaver(platform, slot) {
   const s = SAVER[platform];
   const a = await getAuth();
   if (!s || !a) return {ok: false, error: "Connect the extension first."};
-  if (!["owner", "admin"].includes(a.role)) return {ok: false, error: "Only admins can connect the saver account."};
+  // Instagram: any team member may connect a saver account (main / backup) - the Studio decides who may take which slot.
+  if (platform !== "instagram" && !["owner", "admin"].includes(a.role)) return {ok: false, error: "Only admins can connect the Facebook saver account."};
   let all = [];
   try { all = await chrome.cookies.getAll({url: s.url}); } catch (e) { return {ok: false, error: "Chrome didn't allow reading the login."}; }
   const cookies = all.filter(c => s.names.includes(c.name))
     .map(c => ({name: c.name, value: c.value, domain: c.domain, expirationDate: c.expirationDate || 0}));
   const missing = s.names.filter(n => !cookies.some(c => c.name === n));
   if (missing.length) return {ok: false, error: `Log in to the ${s.label} saver account in this Chrome profile first (not signed in here).`};
-  const r = await api("/api/ext/saver-account", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({platform, cookies})});
+  const r = await api("/api/ext/saver-account", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({platform, slot: slot === "backup" ? "backup" : "main", cookies})});
   if (!r.ok) return {ok: false, error: r.error};
   const st = r.data;
   return {ok: st.status === "ok", status: st, error: st.status === "ok" ? "" : (st.error || st.status)};
@@ -373,7 +374,7 @@ chrome.runtime.onMessage.addListener((m, sender, reply) => {
                     post: c ? {url: c.url, platform: c.platform} : null, studio: STUDIO});
     }
     if (m.do === "connect") { await openConnect(); return reply({ok: true}); }
-    if (m.do === "saver") return reply(await connectSaver(m.platform));
+    if (m.do === "saver") return reply(await connectSaver(m.platform, m.slot));
     if (m.do === "disconnect") { await api("/api/ext/disconnect", {method: "POST"}); await chrome.storage.local.remove("auth"); return reply({ok: true}); }
     if (m.do === "poll") return reply({recent: await poll()});
     if (m.do === "retry") { const r = await api("/api/ext/retry/" + encodeURIComponent(m.id), {method: "POST"});

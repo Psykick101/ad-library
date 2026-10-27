@@ -291,7 +291,7 @@ def fetch_source(url: str) -> tuple[bytes, str, dict]:
     """-> (video bytes, content type, source facts). Raises with yt-dlp's reason (explain() makes it human)."""
     import tempfile
     import yt_dlp
-    acct = accounts.platform_for(url)
+    acct = accounts.active(accounts.platform_for(url))      # Instagram: the main saver account, or the backup while main is down
     use = bool(acct) and accounts.usable(acct)
     with tempfile.TemporaryDirectory() as td, (accounts.cookie_file(acct) if use else contextlib.nullcontext()) as ck:
         opts = _ytdlp_opts(td)
@@ -432,7 +432,7 @@ def work_once() -> bool:
     if not a:
         q("update jobs set status='gone', updated=? where id=?", (time.time(), j["id"]))
         return True
-    acct = accounts.platform_for(j["url"]) if j["mode"] != "direct" else ""
+    acct = accounts.active(accounts.platform_for(j["url"])) if j["mode"] != "direct" else ""
     if acct and accounts.usable(acct):           # the saver account is used gently: random gaps, an hourly cap
         w = accounts.slot_wait(acct)
         if w > 0:
@@ -1276,14 +1276,14 @@ async def bulk_tags(request: Request):
 # ---------- saver accounts + Instagram DM inbox (see accounts.py) ----------
 @guard
 async def accts(request: Request):
-    return JSONResponse({p: accounts.status(p) for p in accounts.PLATFORMS})
+    return JSONResponse({p: accounts.status(p) for p in accounts.SLOTS})
 
 
 @guard
 async def acct(request: Request):
     import asyncio
     p = request.path_params["platform"]
-    if p not in accounts.PLATFORMS:
+    if p not in accounts.SLOTS:
         return JSONResponse({"error": "unknown platform"}, status_code=404)
     run = asyncio.get_running_loop().run_in_executor
     if request.method == "DELETE":
@@ -1307,9 +1307,9 @@ async def ig_inbox(request: Request):
     try:
         return JSONResponse(await asyncio.get_running_loop().run_in_executor(None, accounts.ig_inbox))
     except PermissionError as e:
-        return JSONResponse({"error": str(e), "items": [], "account": accounts.status("instagram")}, status_code=409)
+        return JSONResponse({"error": str(e), "items": [], "account": accounts.status(accounts.active_ig() or "instagram")}, status_code=409)
     except RuntimeError as e:                       # account problem (marked) or Instagram itself misbehaving
-        st = accounts.status("instagram")
+        st = accounts.status(accounts.active_ig() or "instagram")
         code = 409 if st.get("status") in ("login_required", "checkpoint", "expired", "rate_limited") else 502
         return JSONResponse({"error": str(e), "items": [], "account": st}, status_code=code)
     except Exception as e:  # noqa: BLE001  never a bare 500 page: the Studio shows this text to the admin
