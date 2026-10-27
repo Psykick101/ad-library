@@ -65,6 +65,13 @@ def site(req: httpx.Request):
         if STATE["ig"] == "checkpoint":
             return httpx.Response(400, json={"message": "checkpoint_required", "checkpoint_url": "/challenge/abc/"})
         return httpx.Response(200, json={"user": {"username": "psykick.saver", "pk": "61000000001"}, "status": "ok"})
+    if "direct_v2/" in u and STATE.get("dm"):
+        mode = STATE["dm"]
+        STATE["dm_calls"] = STATE.get("dm_calls", 0) + 1
+        if mode == "down" or (mode == "blip" and STATE["dm_calls"] == 1):
+            raise httpx.ConnectError("no route")
+        if mode == "pending500" and "pending_inbox" in u:
+            return httpx.Response(500, text="oops")
     if "direct_v2/inbox" in u:
         return httpx.Response(200, json=json.loads((FIX / "ig_inbox.json").read_text()))
     if "direct_v2/pending_inbox" in u:
@@ -216,6 +223,31 @@ with contextlib.redirect_stdout(OUT), contextlib.redirect_stderr(OUT):
     A.mark("instagram", "login_required", "x")
     case("inbox with a broken session -> error, no call", "error" in c.get("/v1/inbox/instagram", headers=H).json())
     STATE["ig"] = "ok"
+
+    # ---- DM reader robustness: blips retried, a broken request list doesn't lose the main inbox, clear errors
+    A.IG_RETRY_WAIT = 0
+    A.mark("instagram", "ok", "")
+    A._uses.clear()
+    STATE.update(dm="blip", dm_calls=0)
+    ib = c.get("/v1/inbox/instagram", headers=H).json()
+    case("network blip on the inbox -> tried again, DMs read", len(ib.get("items", [])) == 10 and STATE["dm_calls"] == 3, (STATE, ib.get("error")))
+    A._uses.clear()
+    STATE.update(dm="pending500", dm_calls=0)
+    ib = c.get("/v1/inbox/instagram", headers=H).json()
+    case("message-request list failing -> main inbox still read + a warning", len(ib["items"]) > 0 and not any(i["pending"] for i in ib["items"])
+         and "message requests" in ib["warnings"][0], ib.get("warnings"))
+    A._uses.clear()
+    STATE.update(dm="down", dm_calls=0)
+    r = c.get("/v1/inbox/instagram", headers=H)
+    case("Instagram unreachable -> 502 with a plain reason (no crash page), account NOT marked broken",
+         r.status_code == 502 and "couldn't reach Instagram" in r.json()["error"] and A.usable("instagram"), (r.status_code, r.text[:200]))
+    STATE.pop("dm")
+    A._uses.clear()
+    orig = A.ig_inbox
+    A.ig_inbox = lambda: 1 / 0
+    r = c.get("/v1/inbox/instagram", headers=H)
+    case("unexpected bug -> JSON error the Studio can show", r.status_code == 500 and "inbox read failed" in r.json()["error"])
+    A.ig_inbox = orig
 
     # ---- disconnect wipes
     r = c.delete("/v1/accounts/facebook", headers=H).json()

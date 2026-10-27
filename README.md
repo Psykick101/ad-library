@@ -30,6 +30,7 @@ Part of the Psykick / home-lab microservices split (2026-10-25). Each service ha
 - `tests/ext/fixtures/meta_adlibrary.html`
 - `tests/ext/fixtures/tiktok_creative_center.html`
 - `tests/ext/fixtures/tiktok_explore.html`
+- `tests/ext/fixtures/tiktok_explore_v2.html`
 - `tests/ext/fixtures/tiktok_foryou.html`
 - `tests/ext/fixtures/tiktok_video.html`
 - `tests/ext/fixtures/x_timeline.html`
@@ -41,6 +42,7 @@ Part of the Psykick / home-lab microservices split (2026-10-25). Each service ha
 - `tests/fixtures/ig_inbox.json`
 - `tests/fixtures/ig_pending.json`
 - `tests/test_accounts.py`
+- `tests/test_inspiration.py`
 
 ## Deploy
 

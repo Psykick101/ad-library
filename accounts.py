@@ -345,17 +345,35 @@ def ig_parse(inbox: dict, pending: bool = False) -> tuple[dict, list]:
     return {"pk": me, "username": viewer.get("username", "")}, out
 
 
+IG_RETRY_WAIT = 3.0                                # tests set 0
+
+
 def _ig_call(method: str, path: str, **kw) -> dict:
+    """One call to instagram.com as the saver account. Network blips / Instagram 5xx are tried once more after a short
+    pause (only GETs: a repeated POST could send a reply twice). Always raises RuntimeError / PermissionError with a
+    plain-English reason, never a raw httpx error."""
     cookies = load("instagram")
     if not cookies:
         raise PermissionError("the Instagram saver account isn't connected")
-    with _client("instagram", cookies) as c:
-        r = c.request(method, IG + path, **kw)
+    tries = 2 if method == "GET" else 1
+    for k in range(tries):
+        try:
+            with _client("instagram", cookies) as c:
+                r = c.request(method, IG + path, **kw)
+        except httpx.HTTPError as e:
+            if k + 1 < tries:
+                time.sleep(IG_RETRY_WAIT)
+                continue
+            raise RuntimeError(f"couldn't reach Instagram ({type(e).__name__})") from None
+        if r.status_code >= 500 and k + 1 < tries:
+            time.sleep(IG_RETRY_WAIT)
+            continue
+        break
     if r.status_code != 200 or r.headers.get("location"):
         state, detail = classify("instagram", r.status_code, r.headers.get("location", ""), r.text)
-        if state != "ok":
+        if state not in ("ok", "error"):           # login wall / checkpoint / rate limit -> the account rests
             mark("instagram", state, detail)
-        raise RuntimeError(detail)
+        raise RuntimeError(detail if state != "error" else f"Instagram answered {r.status_code}")
     try:
         return r.json()
     except ValueError:
@@ -363,22 +381,29 @@ def _ig_call(method: str, path: str, **kw) -> dict:
 
 
 def ig_inbox(limit: int = 20) -> dict:
-    """The saver account's DMs (main inbox + message requests) -> {"viewer", "items"} or {"busy": seconds}."""
+    """The saver account's DMs (main inbox + message requests) -> {"viewer", "items", "warnings"} or {"busy": seconds}.
+    The main inbox must work; a failing message-request list only adds a warning (its DMs are read on the next pass)."""
     if not usable("instagram"):
         return {"error": "the Instagram saver account isn't connected or needs attention", "items": []}
     w = slot_wait("instagram")
     if w > 0:
         return {"busy": round(w), "items": []}
     slot_take("instagram")
-    items, viewer = [], {}
+    items, viewer, warnings = [], {}, []
     for path, pend in (("/api/v1/direct_v2/inbox/", False), ("/api/v1/direct_v2/pending_inbox/", True)):
-        j = _ig_call("GET", path, params={"persistentBadging": "true", "limit": str(limit), "thread_message_limit": "10"})
+        try:
+            j = _ig_call("GET", path, params={"persistentBadging": "true", "limit": str(limit), "thread_message_limit": "10"})
+        except RuntimeError as e:
+            if not pend:
+                raise
+            warnings.append(f"message requests not read: {e}")
+            continue
         v, its = ig_parse(j, pend)
         viewer = viewer or v
         items += its
     if viewer.get("username"):
         _set_meta("instagram", handle=viewer["username"])
-    return {"viewer": viewer, "items": sorted(items, key=lambda x: x["ts"])}
+    return {"viewer": viewer, "items": sorted(items, key=lambda x: x["ts"]), "warnings": warnings}
 
 
 def ig_reply(thread_id: str, text: str, pending: bool = False) -> bool:

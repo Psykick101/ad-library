@@ -1,4 +1,4 @@
-// Save to Psykick Studio (v1.3) - service worker.
+// Save to Psykick Studio (v1.4) - service worker.
 // Workflow: click / area / right-click -> finder.js works out WHAT it is (a video post, a picture ad, a landing page)
 // and the post's own link -> POST /api/ext/save with the extension token -> the Studio downloads the real video ->
 // we poll /api/ext/status and tell you when it's in Inspiration (or why it failed). A screenshot rides along only as
@@ -209,8 +209,16 @@ async function inject(tab) {
 }
 
 // What was found -> the right kind of save. A blob: video with no post link is NOT saved as a useless frame.
+// The tab's title only describes the post when the post IS the page; on a feed / Explore grid it is boilerplate
+// ("Explore - Find your favorite videos on TikTok") - then the card's own text (or the video's real title) names it.
+function titleFor(tab, f) {
+  const here = F.canonical(tab.url || "");
+  if (!f.post_url || (here && f.post_key && here.key === f.post_key) || ["location", "og"].includes(f.detected)) return tab.title || "";
+  return (f.text || "").split("\n").map(s => s.trim()).find(s => s.length > 3 && !/^@?[\w.-]+$/.test(s))?.slice(0, 160) || "";
+}
+
 async function decideAndSave(tab, f, shotUrl, source) {
-  const base = {page_url: tab.url, title: tab.title, ad_text: f.text || "", data_url: shotUrl || "", source,
+  const base = {page_url: tab.url, title: titleFor(tab, f), ad_text: f.text || "", data_url: shotUrl || "", source,
                 author: f.author || "", detected: f.detected || "", platform: f.platform || ""};
   if (f.kind === "video") {
     if (f.post_url) return save({...base, kind: "video", post_url: f.post_url, media_url: f.media_url || ""}, tab);
@@ -220,8 +228,10 @@ async function decideAndSave(tab, f, shotUrl, source) {
     notify("Open the post itself and press Save", msg);
     return {ok: false, reason: "no-link", message: msg};
   }
-  if (f.kind === "image" && f.media_url && !shotUrl) return save({...base, kind: "image", media_url: f.media_url, page_url: f.post_url || tab.url}, tab);
-  return save({...base, kind: f.kind || "image", page_url: f.post_url || tab.url}, tab);
+  // a picture inside a post: send the post link too, so the server downloads the post's real media (video if it has one)
+  if (f.post_url) return save({...base, kind: "image", post_url: f.post_url, media_url: f.media_url || ""}, tab);
+  if (f.kind === "image" && f.media_url && !shotUrl) return save({...base, kind: "image", media_url: f.media_url}, tab);
+  return save({...base, kind: f.kind || "image"}, tab);
 }
 
 // Drag a box around an ad - or just click a video. Returns what it found (for the tests too).

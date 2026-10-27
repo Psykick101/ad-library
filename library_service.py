@@ -22,6 +22,7 @@ import datetime as dt
 import hashlib
 import io
 import json
+import logging
 import os
 import pathlib
 import re
@@ -35,6 +36,8 @@ import httpx
 import uvicorn
 
 import accounts
+
+log = logging.getLogger("ad-library")
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
@@ -115,6 +118,19 @@ def insert_ad(**v) -> str:
     row["tags"] = row["tags"] or "[]"
     q(f"insert into ads({', '.join(COLS)}) values({', '.join('?' * len(COLS))})", tuple(row[c] for c in COLS))
     return row["id"]
+
+
+# Page titles of feeds / grids / home pages - they name the site, not the ad (a save from a feed sent the tab's title).
+BOILER = re.compile(r"^\s*(\(\d+\)\s*)?(explore\s*-\s*find your favorite videos on tiktok|tiktok\s*-\s*make your day|"
+                    r"for you\s*(\||-)?\s*tiktok|following\s*(\||-)?\s*tiktok|tiktok|instagram|facebook|youtube|x|home\s*/\s*x|"
+                    r"reels|watch|pinterest|linkedin|snapchat|meta ad library|ad library|"
+                    r"(log in|sign up)[^|]*)\s*(\|.*)?$", re.I)
+
+
+def clean_title(title: str) -> str:
+    """"" for a site / feed boilerplate title (the card then shows the AI's summary or the video's own title)."""
+    t = (title or "").strip()
+    return "" if not t or BOILER.match(t) else t[:200]
 
 
 def platform_of(url: str) -> str:
@@ -465,9 +481,35 @@ def work_once() -> bool:
             q("update jobs set status='queued', error=?, next_at=?, updated=? where id=?",
               (reason, time.time() + 20 * tries * tries, time.time(), j["id"]))
             _set(aid, "queued", fetch_error=reason, tries=tries)
+        elif _keep_screenshot(aid, reason):
+            q("update jobs set status='done', error=?, updated=? where id=?", ("kept the screenshot: " + reason, time.time(), j["id"]))
         else:
             q("update jobs set status='failed', error=?, updated=? where id=?", (reason, time.time(), j["id"]))
             _set(aid, "failed", fetch_error=reason, tries=tries)
+    return True
+
+
+NO_VIDEO = ("no video", "unsupported", "isn't supported", "deleted", "has no video")
+
+
+def _keep_screenshot(aid: str, reason: str) -> bool:
+    """A post with no downloadable video (a photo post, a carousel, a removed post) that came with the picture the person
+    selected: keep that picture as the saved ad instead of a failed card. Login / private problems stay failed (an
+    admin can fix those and press Try again)."""
+    a = q("select * from ads where id=?", (aid,), one=True)
+    ex = json.loads((a or {}).get("extra") or "{}")
+    shot = ex.get("thumb") or ""
+    if not a or not shot or not pathlib.Path(shot).is_file() or not any(k in reason.lower() for k in NO_VIDEO):
+        return False
+    data = pathlib.Path(shot).read_bytes()
+    sha = hashlib.sha256(data).hexdigest()[:20]
+    if q("select id from ads where sha=? and id<>?", (sha, aid), one=True):
+        return False
+    ex.update({"fallback": "screenshot", "fetch_note": reason})
+    q("update ads set media=?, kind='image', sha=?, extra=? where id=?", (shot, sha, json.dumps(ex), aid))
+    _set(aid, "reading", fetch_error="")
+    ai_read(aid)
+    _set(aid, "done", fetch_error="")
     return True
 
 
@@ -859,7 +901,7 @@ async def save(request: Request):
     if dup:
         return JSONResponse({"id": dup["id"], "duplicate": True})
     aid = insert_ad(by=by, source=str(form.get("source") or "extension")[:20], platform=plat[:30], page_url=page, media=path,
-                    kind=kind, sha=sha, title=str(form.get("title") or "")[:200], brand=str(form.get("brand") or "")[:120],
+                    kind=kind, sha=sha, title=clean_title(str(form.get("title") or "")), brand=str(form.get("brand") or "")[:120],
                     ad_text=str(form.get("ad_text") or "")[:2000], tags=json.dumps(_clean_tags(str(form.get("tags") or ""))),
                     note=str(form.get("note") or "")[:600], foreplay_id=str(form.get("foreplay_id") or ""),
                     extra=json.dumps({k: str(form.get(k))[:200] for k in ("sender", "sender_name") if form.get(k)}),
@@ -903,9 +945,10 @@ def _queue_save(form, by: str, c: dict | None, target: str, page: str, media_url
     for k in ("author", "post_id", "detected", "sender", "sender_name"):
         if form.get(k):
             extra[k] = str(form.get(k))[:200]
+    title = clean_title(str(form.get("title") or ""))   # a feed's tab title isn't the ad's name -> the video's own title
     aid = insert_ad(by=by, source=str(form.get("source") or "extension")[:20], platform=plat[:30],
                     page_url=(c["url"] if c else page or media_url)[:500], kind="video", sha=f"pending-{_id()}",
-                    title=str(form.get("title") or "")[:200], brand=str(form.get("brand") or "")[:120],
+                    title=title, brand=str(form.get("brand") or "")[:120],
                     ad_text=str(form.get("ad_text") or "")[:2000], tags=json.dumps(_clean_tags(str(form.get("tags") or ""))),
                     note=str(form.get("note") or "")[:600], extra=json.dumps(extra), canon=key, status="queued")
     if c and not (c["direct"] and media_url):
@@ -1263,8 +1306,15 @@ async def ig_inbox(request: Request):
     import asyncio
     try:
         return JSONResponse(await asyncio.get_running_loop().run_in_executor(None, accounts.ig_inbox))
-    except (PermissionError, RuntimeError) as e:
+    except PermissionError as e:
         return JSONResponse({"error": str(e), "items": [], "account": accounts.status("instagram")}, status_code=409)
+    except RuntimeError as e:                       # account problem (marked) or Instagram itself misbehaving
+        st = accounts.status("instagram")
+        code = 409 if st.get("status") in ("login_required", "checkpoint", "expired", "rate_limited") else 502
+        return JSONResponse({"error": str(e), "items": [], "account": st}, status_code=code)
+    except Exception as e:  # noqa: BLE001  never a bare 500 page: the Studio shows this text to the admin
+        log.exception("instagram inbox")
+        return JSONResponse({"error": f"inbox read failed ({type(e).__name__})", "items": []}, status_code=500)
 
 
 @guard
@@ -1274,9 +1324,12 @@ async def ig_reply(request: Request):
     try:
         ok_ = await asyncio.get_running_loop().run_in_executor(None, accounts.ig_reply, str(d.get("thread_id") or ""),
                                                                str(d.get("text") or ""), bool(d.get("pending")))
-        return JSONResponse({"ok": ok_})
+        return JSONResponse({"ok": ok_} if ok_ else {"ok": False, "error": "not a valid conversation id"})
     except (PermissionError, RuntimeError) as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=409)
+    except Exception as e:  # noqa: BLE001
+        log.exception("instagram reply")
+        return JSONResponse({"ok": False, "error": f"reply failed ({type(e).__name__})"}, status_code=500)
 
 
 async def health(request):

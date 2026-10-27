@@ -4,7 +4,7 @@
 // injected into pages (chrome.scripting) before area selection and right-click saves. No DOM access at load time.
 (function (G) {
   "use strict";
-  if (G.PsykickFind && G.PsykickFind.v === 3) return;
+  if (G.PsykickFind && G.PsykickFind.v === 4) return;
 
   function canonical(raw) {
     let u;
@@ -94,13 +94,14 @@
   function tiktokCard(n) {
     if (!n.querySelectorAll) return null;
     const ids = [n, ...n.querySelectorAll("[id*='-7'],[id^='xgwrapper'],[data-video-id],[data-item-id],[id^='one-column-item']")];
-    let id = "";
+    const found = new Set();
     for (const el of ids) {
       const s = (el.id || "") + " " + (el.getAttribute("data-video-id") || "") + " " + (el.getAttribute("data-item-id") || "");
       const m = s.match(/(?:^|\D)(\d{18,20})(?:\D|$)/);
-      if (m) { id = m[1]; break; }
+      if (m) found.add(m[1]);
     }
-    if (!id) return null;
+    if (found.size !== 1) return null;               // none, or a whole grid of cards (not ONE post)
+    const id = [...found][0];
     const au = n.querySelector("a[data-e2e='video-author-avatar'],a[data-e2e='video-author-uniqueid'],a[href^='/@'],a[href*='tiktok.com/@']");
     const user = au ? (new URL(au.getAttribute("href"), "https://www.tiktok.com").pathname.split("/")[1] || "") :
       ((n.querySelector("[data-e2e='video-author-uniqueid']") || {}).textContent || "").trim().replace(/^@?/, "@");
@@ -173,11 +174,45 @@
       const cv = stack || (card && card.querySelector("video"));
       if (cv && shown(cv)) return describeVideo(cv);
     }
-    const p = under ? postFrom(under, rect) : null;
+    // a box mostly around one card wins; else what's under the box's centre; else the best-overlapping card
+    const p = (small ? null : postInRect(rect, 0.6)) || (under ? postFrom(under, rect) : null) || (small ? null : postInRect(rect, 0.35));
     const img = under && (under.tagName === "IMG" ? under : under.querySelector && under.querySelector("img"));
-    return {kind: img || p ? "image" : "page", post_url: p ? p.c.url : "", platform: p ? p.c.platform : "",
-            text: p ? text(p.container) : "", detected: p ? p.how : "", box: null,
+    const post = p ? postKind(p.c) : "";
+    // a grid thumbnail of a VIDEO post (TikTok Explore, Instagram grid, Reels tab...) -> save the real video, not the picture
+    return {kind: post === "video" ? "video" : img || p ? "image" : "page", post_url: p ? p.c.url : "", post_key: p ? p.c.key : "",
+            platform: p ? p.c.platform : "", text: p ? text(p.container) : "", detected: p ? p.how : "", box: null,
+            author: p && p.c.platform === "TikTok" ? ((p.c.url.match(/\/(@[\w.-]+)\//) || [])[1] || "") : "",
             media_url: img && /^https?:/.test(img.currentSrc || img.src) ? (img.currentSrc || img.src) : ""};
+  }
+
+  // Which kind of post a link is: "video" (a video for sure), "image" (a photo post), "" (could be either - the server
+  // tries the video and keeps the screenshot if there is none).
+  function postKind(c) {
+    if (!c) return "";
+    const u = c.url;
+    if (/tiktok\.com\/@[\w.-]+\/video\/|tiktok\.com\/embed|instagram\.com\/(reel|tv)\/|youtube\.com\/(shorts|watch)|facebook\.com\/watch|fb\.watch|snapchat\.com\/spotlight/.test(u)) return "video";
+    if (/tiktok\.com\/@[\w.-]+\/photo\//.test(u)) return "image";
+    return "";
+  }
+
+  // A dragged box with no video in it and nothing found under its centre (overlays, a box over a grid gap...):
+  // the post whose card overlaps the box the most. Cards = the post link itself or its nearest card-sized parent.
+  function postInRect(rect, min) {
+    let best = null, bs = 0;
+    const consider = (c, el, how) => {
+      if (!c) return;
+      let card = el;
+      for (let i = 0; i < 6 && card.parentElement && area(box(card)) < 120 * 120; i++) card = card.parentElement;
+      const b = box(card);
+      if (!shown(card)) return;
+      const ov = overlap(rect, b);
+      const score = Math.max(ov / Math.max(1, area(b)), ov / Math.max(1, area(rect)));
+      if (score > bs) { bs = score; best = {c, container: card, how: how + "-area"}; }
+    };
+    for (const a of document.querySelectorAll("a[href]")) consider(canonical(a.href), a, "link");
+    if (/tiktok\.com$/.test(location.hostname))
+      for (const el of document.querySelectorAll("[data-e2e*='item'],article,[id^='one-column-item']")) consider(tiktokCard(el), el, "tiktok-card");
+    return bs >= (min || 0.35) ? best : null;
   }
 
   function describeVideo(video, b) {
@@ -217,6 +252,6 @@
               : {kind: "page", post_url: "", box: null};
   }
 
-  G.PsykickFind = {v: 3, canonical, inRect, forElement, pagePost, postFrom};
+  G.PsykickFind = {v: 4, canonical, inRect, forElement, pagePost, postFrom, postInRect, postKind};
   if (typeof module !== "undefined" && module.exports) module.exports = G.PsykickFind;
 })(typeof globalThis !== "undefined" ? globalThis : self);
